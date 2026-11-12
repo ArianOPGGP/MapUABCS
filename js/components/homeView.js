@@ -1,7 +1,8 @@
 /**
  * homeView.js
- * Página de Inicio Normal (Sin bloqueo de inicio de sesión)
- * Portal Institucional UABCS - DASC con acceso directo a Horario (SQL), Mapa 2D/3D y Directorio/Eventos
+ * Página de Inicio Oficial de Maps UABCS - DASC
+ * Con identidad visual del logo (favicon.png), acceso directo a Horario SQL,
+ * Mapa Google/Leaflet/MapLibre 2D/3D, Recorrido Virtual 360° Pannellum, Guía AR/GPS y Directorio.
  */
 
 (function () {
@@ -9,26 +10,38 @@
     render(container, state) {
       const home = state.homeInfo || window.DASC_MOCK_DATA.homeInfo;
       const sqlMeta = window.DASCStore.getSQLData();
-      const totalSalones = (sqlMeta.salones || []).length || 17;
+      const totalSalones =
+        (window.AULAS_DASC && (window.AULAS_DASC.salones || window.AULAS_DASC.aulas || []).length) ||
+        (sqlMeta.salones || []).length ||
+        23;
       const totalMaestros = (sqlMeta.maestros || []).length || 55;
       const totalMaterias = (sqlMeta.materias || []).length || 31;
       const totalHorarios =
         (state.sqlStats && state.sqlStats.horarios) ||
         (sqlMeta.horarios ? sqlMeta.horarios.length : 215);
+      const totalEdificios = (window.CAMPUS && window.CAMPUS.edificios.filter((e) => !e.esVialidad).length) || 49;
 
       const isLoggedIn = Boolean(state.user);
 
       container.innerHTML = `
         <section class="view-section home-section">
-          <!-- Hero Principal Institucional -->
+          <!-- Hero Principal Institucional con Logo Maps UABCS -->
           <div class="home-hero-card">
             <div class="home-hero-content">
-              <div class="home-eyebrow-row">
-                <span class="home-inst-badge">
-                  <span class="eyebrow-dot gold"></span>
-                  ${escapeHtml(home.institution)}
-                </span>
-                <span class="home-period-badge">${escapeHtml(home.period)}</span>
+              <div class="home-brand-showcase">
+                <div class="home-logo-medal">
+                  <img src="./favicon.png" alt="Logo Oficial Maps UABCS" class="home-logo-img" />
+                </div>
+                <div class="home-eyebrow-stack">
+                  <div class="home-eyebrow-row">
+                    <span class="home-inst-badge">
+                      <span class="eyebrow-dot gold"></span>
+                      ${escapeHtml(home.institution)}
+                    </span>
+                    <span class="home-period-badge">${escapeHtml(home.period)}</span>
+                  </div>
+                  <span class="home-sub-kicker">SISTEMA INTEGRAL MAPS UABCS · GOOGLE SATÉLITE · MAPLIBRE 3D · GUÍA AR/GPS</span>
+                </div>
               </div>
 
               <h1 class="home-hero-title">
@@ -36,10 +49,8 @@
               </h1>
 
               <p class="home-hero-desc">
-                Bienvenido al portal interactivo del <strong>DASC - UABCS</strong> (<em>"${escapeHtml(home.motto)}"</em>).
-                Explora libremente el <strong>Mapa 2D / Un poco 3D del Campus La Paz</strong> con información de edificios y salones,
-                consulta el <strong>Directorio de Representantes (Maestros Sandoval y Leyva), Oficinas, Cubículos, Área de Servicio, Redes y Eventos</strong>,
-                o inicia sesión con tu correo institucional para acceder a tu <strong>Horario Escolar conectado a SQL</strong>.
+                Bienvenido a <strong>Maps UABCS · Portal DASC</strong> (<em>"${escapeHtml(home.motto)}"</em>).
+                Explora el nuevo <strong>Mapa Cartográfico Real (Google Satélite Híbrido, Google Calles, Leaflet y MapLibre 3D SIIA)</strong> con los <strong>${totalEdificios} edificios del Campus La Paz</strong> y las <strong>${totalSalones} aulas/laboratorios del DASC geolocalizadas</strong>, activa la <strong>Guía por Realidad Aumentada con GPS y Ruteo Peatonal</strong>, o consulta tu <strong>Horario Escolar SQL</strong>.
               </p>
 
               <div class="home-hero-actions">
@@ -49,7 +60,14 @@
                     <line x1="8" y1="2" x2="8" y2="18"/>
                     <line x1="16" y1="6" x2="16" y2="22"/>
                   </svg>
-                  <span>Explorar Mapa 2D / 3D</span>
+                  <span>Abrir Mapa Google / 3D SIIA</span>
+                </button>
+
+                <button type="button" class="btn-action-ar home-cta-btn" id="btn-home-open-ar">
+                  <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <polygon points="3 11 22 2 13 21 11 13 3 11"/>
+                  </svg>
+                  <span>Guía Realidad Aumentada + GPS</span>
                 </button>
 
                 <button type="button" class="btn-gold home-cta-btn" data-go-view="horario">
@@ -61,53 +79,43 @@
                   </svg>
                   <span>${
                     isLoggedIn
-                      ? `Ver Mi Horario (${escapeHtml(state.user.semestre || state.user.semester)}° ${escapeHtml(state.user.turno)} ${escapeHtml(state.user.grupo)})`
-                      : "Acceder a Horario (Iniciar Sesión)"
+                      ? `Mi Horario (${escapeHtml(state.user.semestre || state.user.semester)}° ${escapeHtml(state.user.turno)} ${escapeHtml(state.user.grupo)})`
+                      : "Horario SQL (Iniciar Sesión)"
                   }</span>
-                </button>
-
-                <button type="button" class="btn-secondary-tech home-cta-btn" data-go-view="directorio">
-                  <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
-                    <circle cx="9" cy="7" r="4"/>
-                    <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
-                    <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
-                  </svg>
-                  <span>Directorio y Eventos</span>
                 </button>
               </div>
             </div>
 
-            <!-- Panel Derecho: Estado en Vivo de la Base de Datos SQL -->
+            <!-- Panel Derecho: Estado en Vivo de la Base de Datos SQL + Cartografía -->
             <div class="home-sql-status-card">
               <div class="sql-card-header">
                 <div class="sql-status-pill">
                   <span class="sql-live-dot"></span>
-                  <span>BASE DE DATOS SQL CONECTADA</span>
+                  <span>MOTOR SQL + GIS 3D CONECTADO</span>
                 </div>
-                <span class="sql-engine-tag">SQLite3 / SQL</span>
+                <span class="sql-engine-tag">SQLite3 · GeoJSON · GPS</span>
               </div>
 
-              <h3 class="sql-card-title">Esquema Relacional Oficial IDS</h3>
+              <h3 class="sql-card-title">Infraestructura Digital DASC · Campus La Paz</h3>
               <p class="sql-card-desc">
-                Datos extraídos de los horarios oficiales de <strong>Ingeniería en Desarrollo de Software</strong> de la página del DASC, divididos en tablas normalizadas:
+                Base de datos relacional de horarios de <strong>Ingeniería en Desarrollo de Software</strong> vinculada con coordenadas GPS reales, polígonos 3D SIIA y ruteo peatonal:
               </p>
 
               <div class="sql-metrics-grid">
                 <div class="sql-metric-box">
+                  <span class="sql-metric-val">${totalEdificios}</span>
+                  <span class="sql-metric-label">Edificios Campus</span>
+                  <span class="sql-metric-sub">Geometría 3D SIIA</span>
+                </div>
+                <div class="sql-metric-box">
                   <span class="sql-metric-val">${totalSalones}</span>
-                  <span class="sql-metric-label">Tabla <code>salones</code></span>
-                  <span class="sql-metric-sub">Aulas y Labs DASC</span>
+                  <span class="sql-metric-label">Salones y Labs DASC</span>
+                  <span class="sql-metric-sub">GPS + Ruteo DASC</span>
                 </div>
                 <div class="sql-metric-box">
                   <span class="sql-metric-val">${totalMaestros}</span>
                   <span class="sql-metric-label">Tabla <code>maestros</code></span>
-                  <span class="sql-metric-sub">Docentes asignados</span>
-                </div>
-                <div class="sql-metric-box">
-                  <span class="sql-metric-val">${totalMaterias}</span>
-                  <span class="sql-metric-label">Tabla <code>materias</code></span>
-                  <span class="sql-metric-sub">Asignaturas 1° a 9°</span>
+                  <span class="sql-metric-sub">${totalMaterias} Materias IDS</span>
                 </div>
                 <div class="sql-metric-box">
                   <span class="sql-metric-val">${totalHorarios}</span>
@@ -123,78 +131,78 @@
                     <polyline points="7 10 12 15 17 10"/>
                     <line x1="12" y1="15" x2="12" y2="3"/>
                   </svg>
-                  <span>Ver / Descargar <code>database/uabcs_dasc.sql</code></span>
+                  <span>Descargar <code>database/uabcs_dasc.sql</code></span>
                 </a>
-                <a href="https://www.uabcs.mx/dasc/estudiantes/horarios/horarios-ingenieria-en-desarrollo-de-software/" target="_blank" rel="noopener" class="sql-source-link">
-                  Fuente oficial DASC ↗
+                <a href="./img/Mapa-Campus-La-Paz-2022.pdf" target="_blank" rel="noopener" class="sql-source-link">
+                  Plano Oficial PDF 2022 ↗
                 </a>
               </div>
             </div>
           </div>
 
-          <!-- Apartados Principales del Portal (Horario, Mapa, Directorio) -->
-          <div class="home-modules-grid">
-            <article class="home-module-card" data-go-view="horario" role="button" tabindex="0">
+          <!-- Apartados Principales del Portal (Mapa, AR/VR, Horario, Directorio) -->
+          <div class="home-modules-grid home-modules-4col">
+            <article class="home-module-card" data-go-view="mapa" role="button" tabindex="0">
               <div class="module-card-top">
-                <span class="module-icon-box blue">
-                  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <rect x="3" y="4" width="18" height="18" rx="2"/>
-                    <line x1="16" y1="2" x2="16" y2="6"/>
-                    <line x1="8" y1="2" x2="8" y2="6"/>
-                    <line x1="3" y1="10" x2="21" y2="10"/>
-                  </svg>
+                <span class="module-icon-box gold">
+                  <i class="bi bi-globe-americas" style="font-size: 1.25rem;"></i>
                 </span>
-                <span class="module-badge-pill">Requiere Correo Institucional</span>
+                <span class="module-badge-pill gold">Google Satélite · MapLibre 3D</span>
               </div>
-              <h3>1. Apartado de Horario (Base de Datos SQL)</h3>
+              <h3>1. Mapa Google / Leaflet / 3D SIIA</h3>
               <p>
-                Consulta los horarios de Ingeniería en Desarrollo de Software divididos en <strong>Salón, Maestro y Materia</strong>.
-                Inicia sesión con tu correo institucional y contraseña, o crea tu sesión eligiendo tu <strong>semestre y grupo</strong>.
+                Cambia entre <strong>Google Satélite Híbrido, Google Calles y Vector 3D</strong>, controla la profundidad 3D con la rueda del ratón, calcula rutas peatonales y explora los <strong>${totalEdificios} edificios y ${totalSalones} aulas del DASC</strong>.
               </p>
               <span class="module-link-cta">
-                <span>${isLoggedIn ? "Abrir mi horario activo" : "Iniciar sesión o crear sesión"}</span>
+                <span>Abrir Mapa Cartográfico</span>
                 <span>→</span>
               </span>
             </article>
 
-            <article class="home-module-card" data-go-view="mapa" role="button" tabindex="0">
+            <article class="home-module-card" id="card-home-ar" role="button" tabindex="0">
               <div class="module-card-top">
-                <span class="module-icon-box gold">
-                  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"/>
-                    <line x1="8" y1="2" x2="8" y2="18"/>
-                    <line x1="16" y1="6" x2="16" y2="22"/>
-                  </svg>
+                <span class="module-icon-box blue">
+                  <i class="bi bi-compass-fill" style="font-size: 1.25rem;"></i>
                 </span>
-                <span class="module-badge-pill gold">Acceso Libre · 2D y Un poco 3D</span>
+                <span class="module-badge-pill">Cámara AR · GPS · Ruteo</span>
               </div>
-              <h3>2. Mapa Campus La Paz (2D / Un poco 3D)</h3>
+              <h3>2. Realidad Aumentada + Ruteo GPS</h3>
               <p>
-                Basado en el plano oficial <code>Mapa-Campus-La-Paz-2022.pdf</code>. Alterna entre vista 2D e inclinación 3D,
-                haz clic en cualquier edificio para ver su referencia y explora los <strong>salones y laboratorios del DASC (DSC-39 y DSC-46)</strong>.
+                Navegación peatonal con <strong>cámara en vivo, brújula magnética, flecha 3D direccional, cálculo Haversine y mapa de ruta Leaflet con cono de visión</strong> hacia cualquier salón o edificio.
               </p>
               <span class="module-link-cta">
-                <span>Abrir Mapa Interactivo</span>
+                <span>Iniciar Guía AR</span>
+                <span>→</span>
+              </span>
+            </article>
+
+            <article class="home-module-card" data-go-view="horario" role="button" tabindex="0">
+              <div class="module-card-top">
+                <span class="module-icon-box emerald">
+                  <i class="bi bi-calendar3-week" style="font-size: 1.25rem;"></i>
+                </span>
+                <span class="module-badge-pill emerald">Base de Datos SQLite3</span>
+              </div>
+              <h3>3. Horario Oficial IDS (SQL)</h3>
+              <p>
+                Consulta los horarios oficiales divididos en <strong>Salón, Maestro y Materia</strong>. Haz clic en cualquier clase para volar directamente a su aula en el mapa 3D o activar la guía AR.
+              </p>
+              <span class="module-link-cta">
+                <span>${isLoggedIn ? "Abrir mi horario activo" : "Iniciar sesión institucional"}</span>
                 <span>→</span>
               </span>
             </article>
 
             <article class="home-module-card" data-go-view="directorio" role="button" tabindex="0">
               <div class="module-card-top">
-                <span class="module-icon-box emerald">
-                  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
-                    <circle cx="9" cy="7" r="4"/>
-                    <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
-                    <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
-                  </svg>
+                <span class="module-icon-box blue">
+                  <i class="bi bi-people-fill" style="font-size: 1.25rem;"></i>
                 </span>
-                <span class="module-badge-pill emerald">Sandoval, Leyva, Áreas y Eventos</span>
+                <span class="module-badge-pill">Sandoval, Leyva y Eventos</span>
               </div>
-              <h3>3. Directorio DASC, Áreas Clave y Eventos</h3>
+              <h3>4. Directorio DASC y Eventos</h3>
               <p>
-                Consulta a los representantes principales (<strong>Dr. Jesús Andrés Sandoval Bringas</strong> y <strong>M.T.I. Amado Alejandro Leyva Carrillo</strong>),
-                sus oficinas, cubículo de maestros, área de servicio, redes y los eventos oficiales vigentes del DASC.
+                Consulta a los representantes principales (<strong>Dr. Jesús Andrés Sandoval Bringas</strong> y <strong>M.T.I. Amado Alejandro Leyva Carrillo</strong>), oficinas, cubículos, talleres y eventos vigentes.
               </p>
               <span class="module-link-cta">
                 <span>Ver Directorio y Eventos</span>
@@ -288,6 +296,28 @@
           }
         });
       });
+
+      const openArDirect = () => {
+        window.DASCStore.openARGuide({
+          buildingId: "dsc-39",
+          destinationLabel: "LAB A · Laboratorio de Cómputo A (DSC-39)",
+          aulaId: "LAB A"
+        });
+      };
+
+      const btnHomeAr = container.querySelector("#btn-home-open-ar");
+      if (btnHomeAr) btnHomeAr.addEventListener("click", openArDirect);
+
+      const cardHomeAr = container.querySelector("#card-home-ar");
+      if (cardHomeAr) {
+        cardHomeAr.addEventListener("click", openArDirect);
+        cardHomeAr.addEventListener("keydown", (e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            openArDirect();
+          }
+        });
+      }
     }
   };
 

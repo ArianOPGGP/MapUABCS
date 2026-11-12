@@ -1,9 +1,10 @@
 /**
  * navbar.js
- * Barra de navegación principal siempre visible:
+ * Barra de navegación principal con el logo oficial "Maps UABCS" (favicon.png):
  * - Inicio (Página principal normal sin login)
  * - Horario (Con acceso mediante correo institucional y contraseña)
- * - Mapa (2D / Un poco 3D Campus La Paz UABCS)
+ * - Mapa 2D/3D/360° (Google Maps Satélite / Calles + MapLibre 3D + Pannellum 360°)
+ * - Guía AR / GPS (Cámara en vivo + Brújula + Ruteo Peatonal Leaflet)
  * - Directorio (Representantes Sandoval y Leyva, Oficinas, Cubículos, Redes y Eventos)
  */
 
@@ -54,22 +55,22 @@
         {
           id: "inicio",
           label: "Inicio",
-          icon: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>`
+          icon: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>`
         },
         {
           id: "horario",
-          label: "Horario",
-          icon: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>`
+          label: "Horario SQL",
+          icon: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>`
         },
         {
           id: "mapa",
-          label: "Mapa",
-          icon: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"/><line x1="8" y1="2" x2="8" y2="18"/><line x1="16" y1="6" x2="16" y2="22"/></svg>`
+          label: "Mapa 2D/3D",
+          icon: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"/><line x1="8" y1="2" x2="8" y2="18"/><line x1="16" y1="6" x2="16" y2="22"/></svg>`
         },
         {
           id: "directorio",
           label: "Directorio",
-          icon: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>`
+          icon: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>`
         }
       ];
 
@@ -77,20 +78,23 @@
         navItems.push({
           id: "admin",
           label: "Admin",
-          icon: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>`
+          icon: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>`
         });
       }
 
       container.innerHTML = `
         <header class="dasc-navbar">
           <div class="navbar-inner">
-            <div class="navbar-brand" id="nav-brand-home" title="Ir a la página de Inicio">
-              <div class="brand-emblem">
-                <span class="brand-uabcs">UABCS</span>
-                <span class="brand-dasc">DASC</span>
+            <div class="navbar-brand" id="nav-brand-home" title="Maps UABCS · Ir a la página de Inicio">
+              <div class="brand-logo-wrap">
+                <img src="./favicon.png" alt="Logo Maps UABCS" class="brand-logo-img" />
+                <span class="brand-logo-pulse"></span>
               </div>
               <div class="brand-text">
-                <h1>Portal UABCS - DASC</h1>
+                <div class="brand-title-line">
+                  <h1>Maps UABCS</h1>
+                  <span class="brand-dasc-pill">DASC · SIIA</span>
+                </div>
                 <p>Sistemas Computacionales · Campus La Paz</p>
               </div>
             </div>
@@ -115,6 +119,19 @@
               `
                 )
                 .join("")}
+
+              <button
+                type="button"
+                class="nav-tab-btn nav-ar-direct-btn ${state.arOverlayActive ? "active" : ""}"
+                id="btn-nav-open-ar"
+                title="Abrir Navegación por Realidad Aumentada, GPS y Ruteo Peatonal"
+              >
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <polygon points="3 11 22 2 13 21 11 13 3 11"/>
+                </svg>
+                <span>Guía AR / GPS</span>
+                <span class="nav-live-badge">LIVE</span>
+              </button>
             </nav>
 
             <div class="navbar-user">
@@ -182,6 +199,22 @@
           window.DASCStore.setView(targetView);
         });
       });
+
+      const arBtn = container.querySelector("#btn-nav-open-ar");
+      if (arBtn) {
+        arBtn.addEventListener("click", () => {
+          if (state.arOverlayActive) {
+            window.DASCStore.closeARGuide();
+          } else {
+            const currentTarget = state.arTarget || {
+              buildingId: "dsc-39",
+              destinationLabel: "LAB A · Laboratorio de Cómputo A (DSC-39)",
+              aulaId: "LAB A"
+            };
+            window.DASCStore.openARGuide(currentTarget);
+          }
+        });
+      }
 
       const brandHome = container.querySelector("#nav-brand-home");
       if (brandHome) {

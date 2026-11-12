@@ -27,12 +27,11 @@
             <!-- Columna Izquierda: Formulario de Inicio de Sesión / Creación de Sesión SQL -->
             <div class="auth-form-pane">
               <div class="auth-brand-row">
-                <div class="auth-brand-emblem">
-                  <span class="emblem-top">UABCS</span>
-                  <span class="emblem-bot">DASC</span>
+                <div class="auth-logo-medal">
+                  <img src="./favicon.png" alt="Logo Maps UABCS" class="auth-logo-img" />
                 </div>
                 <div class="auth-brand-meta">
-                  <span class="brand-inst">Acceso al Apartado de Horario Escolar</span>
+                  <span class="brand-inst">Maps UABCS · Acceso a Horario Escolar</span>
                   <span class="brand-dept">Ingeniería en Desarrollo de Software · Base SQL</span>
                 </div>
               </div>

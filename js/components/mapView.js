@@ -1,989 +1,1757 @@
 /**
  * mapView.js
- * Mapa Interactivo 2D que se puede poner "un poco 3D" (inclinación 2.5D/3D ajustable)
- * Basado en el plano oficial de la UABCS: Mapa-Campus-La-Paz-2022.pdf
- * Incluye todos los sectores del Campus La Paz y el detalle de SALONES en los edificios del DASC (DSC-39 y DSC-46).
+ * Sistema Cartográfico Integral Maps UABCS - DASC:
+ * 1. Mapa Interactivo 2D / 3D (MapLibre GL + Google Maps Satélite Híbrido / Google Calles / Vector SIIA + Control de Profundidad 2D↔3D + Ruteo Peatonal Dijkstra)
+ * 2. Plano Oficial Campus La Paz 2022 (PDF) y Croquis de Talleres DASC
  */
 
 (function () {
-  let panOffset = { x: 0, y: 0 };
-  let isDraggingMap = false;
-  let dragStart = { x: 0, y: 0 };
-  let activeCategoryFilter = "all"; // 'all' | 'dasc' | 'admin' | 'services' | 'depts'
-  let selectedSalonCodeInPanel = null;
+  let mapInstance = null;
+  let mapLoaded = false;
+  let currentPopup = null;
+  let activeBaseStyle = "satelite"; // 'satelite' | 'google_calles' | 'oscuro' | 'claro'
+  let depthPct = 85; // 0 = 2D plano, 100 = 3D máximo
+  let usePaletaSIIA = true;
+  let showAulaPins = true;
+  let showEventPins = true;
+  let isRotating360 = false;
+  let rotateAnimId = null;
+  let aulaMarkers = [];
+  let eventMarkers = [];
+  let routeMarkers = [];
+  let activeRouteOrigin = "entrada-principal";
+  let userGpsCoords = null;
+  let userLocationMarker = null;
+  let gpsBannerTimeout = null;
+  let currentRouteData = null;
 
-  let panoYaw = 15;
-  let panoPitch = 0;
-  let isDraggingPano = false;
-  let panoDragStart = { x: 0, y: 0, yaw: 0, pitch: 0 };
-  let autoRotate360 = true;
-  let panoAnimFrame = null;
+  // Estado del panel lateral
+  let activeSidebarTab = "dasc"; // 'dasc' | 'campus' | 'eventos'
+  let searchQuery = "";
+  let selectedPlantaFilter = "all";
+  let selectedCampusCat = "todas";
 
-  function stopPanoLoop() {
-    if (panoAnimFrame) {
-      cancelAnimationFrame(panoAnimFrame);
-      panoAnimFrame = null;
+  const BASE_STYLES = {
+    satelite: {
+      name: "Google Satélite + 3D",
+      type: "raster",
+      tiles: [
+        "https://mt0.google.com/vt/lyrs=y&hl=es&x={x}&y={y}&z={z}",
+        "https://mt1.google.com/vt/lyrs=y&hl=es&x={x}&y={y}&z={z}"
+      ]
+    },
+    google_calles: {
+      name: "Google Calles + 3D",
+      type: "raster",
+      tiles: [
+        "https://mt0.google.com/vt/lyrs=m&hl=es&x={x}&y={y}&z={z}",
+        "https://mt1.google.com/vt/lyrs=m&hl=es&x={x}&y={y}&z={z}"
+      ]
+    },
+    oscuro: {
+      name: "Vector 3D Oscuro",
+      type: "vector",
+      url: "https://tiles.openfreemap.org/styles/dark"
+    },
+    claro: {
+      name: "Vector 3D Claro",
+      type: "vector",
+      url: "https://tiles.openfreemap.org/styles/positron"
     }
-  }
+  };
 
-  function filterBuildingsByCategory(buildings, filter) {
-    if (filter === "dasc") {
-      return buildings.filter((b) => b.isDascBuilding);
-    }
-    if (filter === "admin") {
-      return buildings.filter((b) =>
-        ["ad-19", "ad-20", "ad-52", "ad-55", "ad-65"].includes(b.id.toLowerCase())
-      );
-    }
-    if (filter === "services") {
-      return buildings.filter((b) =>
-        ["ad-18", "ad-10", "ad-21", "ad-01", "ad-59"].includes(b.id.toLowerCase())
-      );
-    }
-    if (filter === "depts") {
-      return buildings.filter((b) =>
-        ["cmt-03", "csh-02", "ca-04"].includes(b.id.toLowerCase())
-      );
-    }
-    return buildings;
+  function getRasterStyleObject(tiles) {
+    return {
+      version: 8,
+      glyphs: "https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf",
+      sources: {
+        "raster-tiles": {
+          type: "raster",
+          tiles: tiles,
+          tileSize: 256,
+          maxzoom: 20,
+          attribution: "© Google Maps · UABCS Campus La Paz"
+        }
+      },
+      layers: [
+        {
+          id: "raster-layer",
+          type: "raster",
+          source: "raster-tiles",
+          minzoom: 0,
+          maxzoom: 22
+        }
+      ]
+    };
   }
 
   window.DASCMapView = {
     render(container, state) {
-      stopPanoLoop();
+      const sel = state.mapSelection || {};
+      const subMode = sel.mapSubMode === "pdf" ? "pdf" : "interactive";
 
-      const allBuildings = window.DASCStore.getBuildings();
-      const filteredBuildings = filterBuildingsByCategory(
-        allBuildings,
-        activeCategoryFilter
-      );
-      const mapSel = state.mapSelection;
-      const selectedBuilding =
-        window.DASCStore.getBuildingById(mapSel.buildingId) || allBuildings[0];
-
-      if (mapSel.highlightRoom && selectedBuilding.salonesDasc) {
-        const matchedSalon = selectedBuilding.salonesDasc.find((s) =>
-          mapSel.highlightRoom.toUpperCase().includes(s.codigo.toUpperCase())
-        );
-        if (matchedSalon) {
-          selectedSalonCodeInPanel = matchedSalon.codigo;
+      // Si el shell ya existe y estamos en el mismo subModo, actualizamos dinámicamente sin destruir el WebGL
+      const existingShell = container.querySelector("#dasc-map-pro-shell");
+      if (existingShell && existingShell.getAttribute("data-submode") === subMode) {
+        updateHeaderModeButtons(container, subMode);
+        if (subMode === "interactive") {
+          renderSidebarContent(container, state);
+          renderDetailBottomCard(container, state);
+          if (sel.autoTriggered) {
+            focusSelectedTargetOnMap(state);
+          }
+          return;
         }
-      } else if (
-        selectedBuilding.salonesDasc &&
-        selectedBuilding.salonesDasc.length > 0 &&
-        (!selectedSalonCodeInPanel ||
-          !selectedBuilding.salonesDasc.some(
-            (s) => s.codigo === selectedSalonCodeInPanel
-          ))
-      ) {
-        selectedSalonCodeInPanel = selectedBuilding.salonesDasc[0].codigo;
       }
 
-      const tiltDeg = mapSel.mode3D ? Number(mapSel.tiltAngle || 38) : 0;
-      const rotZDeg = mapSel.mode3D ? -10 : 0;
+      // Si estamos montando un contenedor nuevo o cambiando de subModo, limpiar instancias previas
+      if (mapInstance) {
+        stopRotation360();
+        try {
+          mapInstance.remove();
+        } catch (e) {}
+        mapInstance = null;
+        mapLoaded = false;
+      }
 
-      const buildingEvents = state.events.filter(
-        (ev) => String(ev.buildingId).toLowerCase() === selectedBuilding.id.toLowerCase()
-      );
-      const buildingProfessors = state.professors.filter(
-        (p) => String(p.buildingId).toLowerCase() === selectedBuilding.id.toLowerCase()
-      );
-
-      const originPoint = { x: 480, y: 745 };
-      const targetCenter = {
-        x: selectedBuilding.mapCoords.x + selectedBuilding.mapCoords.width / 2,
-        y: selectedBuilding.mapCoords.y + selectedBuilding.mapCoords.height / 2
-      };
+      const totalEdificios =
+        (window.CAMPUS && window.CAMPUS.edificios.filter((e) => !e.esVialidad).length) || 49;
+      const totalAulas =
+        (window.AULAS_DASC && (window.AULAS_DASC.salones || window.AULAS_DASC.aulas || []).length) || 23;
 
       container.innerHTML = `
-        <section class="view-section map-section">
-          <div class="map-top-reference-bar">
-            <div class="map-ref-title">
-              <span class="section-eyebrow">
-                <span class="eyebrow-dot gold"></span>
-                <span>CARTOGRAFÍA OFICIAL CAMPUS LA PAZ · UABCS</span>
-              </span>
-              <h2>Mapa Campus UABCS 2D / Un poco 3D y Salones del DASC</h2>
-              <p>
-                Haz clic en cualquier edificio del campus para consultar su información oficial. En los edificios del DASC (<strong>DSC-39</strong> y <strong>DSC-46</strong>) puedes inspeccionar todos sus <strong>salones y laboratorios</strong> conectados a la base SQL.
-              </p>
+        <section class="view-section map-pro-section" id="dasc-map-pro-shell" data-submode="${escapeHtml(subMode)}">
+          <!-- Cabecera Principal con Logo Maps UABCS con Alta Prioridad y Controles -->
+          <div class="map-pro-topbar">
+            <div class="map-pro-brand">
+              <img src="./favicon.png" alt="Maps UABCS" class="map-pro-logo" />
+              <div>
+                <div class="map-pro-eyebrow">
+                  <span class="eyebrow-dot gold"></span>
+                  <span>CARTOGRAFÍA OFICIAL CAMPUS LA PAZ · GOOGLE MAPS + MAPLIBRE 3D + RUTEO PEATONAL</span>
+                </div>
+                <h2>Maps UABCS · ${totalEdificios} Edificios SIIA y ${totalAulas} Aulas/Labs DASC Geolocalizados</h2>
+              </div>
             </div>
 
-            <div class="map-ref-actions">
-              <a
-                href="./assets/Mapa-Campus-La-Paz-2022.pdf"
-                target="_blank"
-                rel="noopener"
-                class="btn-gold map-pdf-btn"
-                title="Abrir plano oficial PDF de la UABCS"
+            <div class="map-pro-mode-tabs" role="tablist">
+              <button
+                type="button"
+                class="map-mode-tab-btn ${subMode === "interactive" ? "active" : ""}"
+                data-map-submode="interactive"
               >
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-                  <polyline points="14 2 14 8 20 8"/>
-                </svg>
-                <span>Plano Oficial PDF (2022)</span>
-              </a>
+                <i class="bi bi-globe-americas"></i>
+                <span>Mapa Google / 3D SIIA</span>
+              </button>
+              <button
+                type="button"
+                class="map-mode-tab-btn ${subMode === "pdf" ? "active" : ""}"
+                data-map-submode="pdf"
+              >
+                <i class="bi bi-file-earmark-pdf-fill"></i>
+                <span>Plano Oficial PDF</span>
+              </button>
+              <button
+                type="button"
+                class="map-mode-tab-btn ar-launch-tab"
+                id="btn-map-topbar-ar"
+              >
+                <i class="bi bi-compass-fill"></i>
+                <span>Guía Cámara AR + GPS</span>
+              </button>
             </div>
           </div>
 
-          <div class="map-toolbar">
-            <div class="map-category-filters" role="tablist" aria-label="Filtrar sectores del Campus UABCS">
-              <button
-                type="button"
-                class="cat-filter-btn ${activeCategoryFilter === "all" ? "active" : ""}"
-                data-map-cat="all"
-              >
-                Todo el Campus (${allBuildings.length})
-              </button>
-              <button
-                type="button"
-                class="cat-filter-btn cat-dasc ${activeCategoryFilter === "dasc" ? "active" : ""}"
-                data-map-cat="dasc"
-              >
-                Edificios DASC y Salones (DSC-39 / DSC-46)
-              </button>
-              <button
-                type="button"
-                class="cat-filter-btn ${activeCategoryFilter === "admin" ? "active" : ""}"
-                data-map-cat="admin"
-              >
-                Rectoría, Biblioteca y CTIC
-              </button>
-              <button
-                type="button"
-                class="cat-filter-btn ${activeCategoryFilter === "services" ? "active" : ""}"
-                data-map-cat="services"
-              >
-                DELE, Cafetería, Servicios Médicos y Deportes
-              </button>
-              <button
-                type="button"
-                class="cat-filter-btn ${activeCategoryFilter === "depts" ? "active" : ""}"
-                data-map-cat="depts"
-              >
-                Otros Departamentos Académicos
-              </button>
-            </div>
-
-            <div class="map-controls-row">
-              <div class="map-building-chips" role="tablist" aria-label="Edificios del Campus">
-                ${filteredBuildings
-                  .map(
-                    (b) => `
-                  <button
-                    type="button"
-                    class="building-chip ${b.id === selectedBuilding.id ? "active" : ""} ${b.isDascBuilding ? "is-dasc-chip" : ""}"
-                    data-select-building="${escapeHtml(b.id)}"
-                  >
-                    <span class="chip-code">${escapeHtml(b.code)}</span>
-                    <span>${escapeHtml(b.shortName)}</span>
-                  </button>
-                `
-                  )
-                  .join("")}
-              </div>
-
-              <div class="map-view-controls">
-                <div class="mode-toggle-group" role="group" aria-label="Modo 2D o Un poco 3D">
-                  <button
-                    type="button"
-                    class="btn-mode-toggle ${!mapSel.mode3D ? "active" : ""}"
-                    data-map-mode="2d"
-                  >
-                    Mapa 2D Plano
-                  </button>
-                  <button
-                    type="button"
-                    class="btn-mode-toggle ${mapSel.mode3D ? "active" : ""}"
-                    data-map-mode="3d"
-                  >
-                    Un poco 3D (${tiltDeg}°)
-                  </button>
-                </div>
-
-                ${
-                  mapSel.mode3D
-                    ? `
-                  <div class="tilt-slider-box" title="Ajustar inclinación 3D del mapa">
-                    <label for="map-tilt-range">Inclinación 3D:</label>
-                    <input
-                      type="range"
-                      id="map-tilt-range"
-                      min="15"
-                      max="52"
-                      step="1"
-                      value="${tiltDeg}"
-                    />
-                  </div>
-                `
-                    : ""
-                }
-
-                <div class="zoom-controls">
-                  <button type="button" class="btn-icon-map" id="btn-zoom-out" title="Alejar mapa">−</button>
-                  <span class="zoom-readout">${Math.round(mapSel.zoomLevel * 100)}%</span>
-                  <button type="button" class="btn-icon-map" id="btn-zoom-in" title="Acercar mapa">+</button>
-                  <button type="button" class="btn-icon-map" id="btn-zoom-reset" title="Centrar vista">
-                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                      <circle cx="12" cy="12" r="3"/>
-                      <path d="M12 2v3M12 19v3M2 12h3M19 12h3"/>
-                    </svg>
-                  </button>
-                </div>
-              </div>
-            </div>
+          <!-- Cuerpo Dinámico según el Modo Seleccionado -->
+          <div class="map-pro-body">
+            ${
+              subMode === "interactive"
+                ? renderInteractiveMapLayout()
+                : renderPdfLayout()
+            }
           </div>
-
-          <div class="map-workspace">
-            <div class="map-viewport" id="dasc-map-viewport">
-              <div class="map-compass" title="Orientación Campus La Paz UABCS">
-                <span class="compass-n">N</span>
-                <div class="compass-arrow"></div>
-              </div>
-
-              <div class="map-legend-pill">
-                <span class="legend-item"><i class="dot-dasc"></i> DASC (DSC-39 / DSC-46)</span>
-                <span class="legend-item"><i class="dot-origin"></i> Acceso Principal Forjadores</span>
-                <span class="legend-item"><i class="dot-target"></i> ${escapeHtml(selectedBuilding.code)} (${escapeHtml(selectedBuilding.distanceMeters)} m)</span>
-              </div>
-
-              <div
-                class="map-scene-plane ${mapSel.mode3D ? "is-3d" : "is-2d"}"
-                id="dasc-map-plane"
-                style="transform: translate3d(${panOffset.x}px, ${panOffset.y}px, 0) scale(${mapSel.zoomLevel}) ${
-                  mapSel.mode3D
-                    ? `rotateX(${tiltDeg}deg) rotateZ(${rotZDeg}deg)`
-                    : "rotateX(0deg) rotateZ(0deg)"
-                };"
-              >
-                <svg class="map-ground-svg" viewBox="0 0 1000 800" preserveAspectRatio="none">
-                  <defs>
-                    <pattern id="dascGrid" width="40" height="40" patternUnits="userSpaceOnUse">
-                      <path d="M 40 0 L 0 0 0 40" fill="none" stroke="rgba(59, 130, 246, 0.1)" stroke-width="1"/>
-                    </pattern>
-                    <linearGradient id="routeGrad" x1="0%" y1="100%" x2="100%" y2="0%">
-                      <stop offset="0%" stop-color="#10B981"/>
-                      <stop offset="50%" stop-color="#3B82F6"/>
-                      <stop offset="100%" stop-color="#F59E0B"/>
-                    </linearGradient>
-                  </defs>
-
-                  <rect width="1000" height="800" fill="url(#dascGrid)" />
-
-                  <rect x="45" y="45" width="910" height="715" rx="30" fill="rgba(15, 23, 42, 0.68)" stroke="rgba(148, 163, 184, 0.22)" stroke-width="2"/>
-
-                  <rect x="380" y="235" width="285" height="160" rx="20" fill="rgba(132, 204, 22, 0.08)" stroke="rgba(132, 204, 22, 0.45)" stroke-width="2" stroke-dasharray="8 5"/>
-                  <text x="522" y="255" fill="rgba(163, 230, 53, 0.9)" font-size="11" text-anchor="middle" font-weight="700" letter-spacing="1">SECTOR DASC · DSC-39 Y DSC-46</text>
-
-                  <path d="M 80 760 L 920 760" fill="none" stroke="rgba(71, 85, 105, 0.75)" stroke-width="28" stroke-linecap="round"/>
-                  <text x="500" y="788" fill="rgba(148, 163, 184, 0.8)" font-size="12" text-anchor="middle" font-weight="700" letter-spacing="2">BLVD. FORJADORES DE SUDCALIFORNIA · ACCESO PRINCIPAL UABCS</text>
-
-                  <path d="M 480 745 L 480 200" fill="none" stroke="rgba(51, 65, 85, 0.85)" stroke-width="22" stroke-linecap="round"/>
-                  <path d="M 220 500 L 860 500" fill="none" stroke="rgba(51, 65, 85, 0.85)" stroke-width="20" stroke-linecap="round"/>
-                  <path d="M 220 350 L 890 350" fill="none" stroke="rgba(51, 65, 85, 0.85)" stroke-width="18" stroke-linecap="round"/>
-                  <path d="M 220 220 L 720 220" fill="none" stroke="rgba(51, 65, 85, 0.8)" stroke-width="16" stroke-linecap="round"/>
-
-                  <path
-                    d="M ${originPoint.x} ${originPoint.y} L ${originPoint.x} ${targetCenter.y} L ${targetCenter.x} ${targetCenter.y}"
-                    fill="none"
-                    stroke="url(#routeGrad)"
-                    stroke-width="6"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                    stroke-dasharray="12 8"
-                    class="animated-route-line"
-                  />
-                </svg>
-
-                <div class="map-student-origin" style="left: ${originPoint.x}px; top: ${originPoint.y}px;">
-                  <div class="origin-pulse"></div>
-                  <div class="origin-dot"></div>
-                  <span class="origin-label">Entrada UABCS</span>
-                </div>
-
-                ${allBuildings
-                  .map((b) => {
-                    const isSelected = b.id === selectedBuilding.id;
-                    const isDimmed =
-                      activeCategoryFilter !== "all" &&
-                      !filteredBuildings.some((fb) => fb.id === b.id);
-                    const { x, y, width, height, height3d } = b.mapCoords;
-                    const salonesCount = (b.salonesDasc || []).length;
-
-                    return `
-                      <div
-                        class="map-building-node ${isSelected ? "selected" : ""} ${b.isDascBuilding ? "dasc-node" : ""} ${isDimmed ? "dimmed-node" : ""}"
-                        data-building-node="${escapeHtml(b.id)}"
-                        style="left: ${x}px; top: ${y}px; width: ${width}px; height: ${height}px; --b-color: ${b.mapCoords.color}; --b-height: ${height3d}px;"
-                        role="button"
-                        tabindex="0"
-                        aria-label="Seleccionar ${escapeHtml(b.name)}"
-                      >
-                        <div class="building-shadow"></div>
-                        <div class="building-box-3d">
-                          <div class="building-wall wall-front"></div>
-                          <div class="building-wall wall-back"></div>
-                          <div class="building-wall wall-left"></div>
-                          <div class="building-wall wall-right"></div>
-                          <div class="building-roof">
-                            <span class="roof-code">${escapeHtml(b.code)}</span>
-                            <span class="roof-name">${escapeHtml(b.shortName)}</span>
-                            ${
-                              salonesCount > 0
-                                ? `<span class="roof-event-badge">${salonesCount} Salones</span>`
-                                : ""
-                            }
-                          </div>
-                        </div>
-
-                        ${
-                          isSelected
-                            ? `
-                          <div class="building-selected-ring"></div>
-                          <div class="building-floating-pin">
-                            <span class="pin-title">${escapeHtml(
-                              mapSel.highlightRoom || b.shortName
-                            )}</span>
-                            <span class="pin-arrow">▼</span>
-                          </div>
-                        `
-                            : ""
-                        }
-                      </div>
-                    `;
-                  })
-                  .join("")}
-              </div>
-            </div>
-
-            <aside class="building-floating-card" aria-live="polite">
-              <div class="building-card-header">
-                <div class="building-header-badges">
-                  <span class="badge-code" style="border-color: ${escapeHtml(selectedBuilding.mapCoords.color)};">
-                    ${escapeHtml(selectedBuilding.code)}
-                  </span>
-                  <span class="badge-category">${escapeHtml(selectedBuilding.category)}</span>
-                  <span class="badge-distance">${escapeHtml(selectedBuilding.distanceMeters)} m</span>
-                </div>
-                <h3>${escapeHtml(selectedBuilding.name)}</h3>
-                <p class="building-desc">${escapeHtml(selectedBuilding.description)}</p>
-              </div>
-
-              ${
-                mapSel.highlightRoom
-                  ? `
-                <div class="highlighted-room-banner">
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/>
-                    <circle cx="12" cy="10" r="3"/>
-                  </svg>
-                  <div>
-                    <span class="hl-label">Ubicación seleccionada:</span>
-                    <strong class="hl-value">${escapeHtml(mapSel.highlightRoom)}</strong>
-                  </div>
-                </div>
-              `
-                  : ""
-              }
-
-              <div class="building-primary-actions">
-                ${
-                  selectedBuilding.panorama360
-                    ? `
-                  <button
-                    type="button"
-                    class="btn-360-tour"
-                    id="btn-open-360"
-                    data-building-id="${escapeHtml(selectedBuilding.id)}"
-                  >
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                      <circle cx="12" cy="12" r="10"/>
-                      <ellipse cx="12" cy="12" rx="10" ry="4"/>
-                      <line x1="12" y1="2" x2="12" y2="22"/>
-                    </svg>
-                    <span>Vista Interior 360°</span>
-                  </button>
-                `
-                    : ""
-                }
-
-                <button
-                  type="button"
-                  class="btn-ar-from-map"
-                  id="btn-open-ar-map"
-                  data-building-id="${escapeHtml(selectedBuilding.id)}"
-                  data-destination="${escapeHtml(mapSel.highlightRoom || selectedBuilding.name)}"
-                  title="Iniciar Guía AR"
-                >
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <polygon points="3 11 22 2 13 21 11 13 3 11"/>
-                  </svg>
-                  <span>Guía AR</span>
-                </button>
-              </div>
-
-              ${
-                selectedBuilding.isDascBuilding &&
-                selectedBuilding.salonesDasc &&
-                selectedBuilding.salonesDasc.length > 0
-                  ? renderDascSalonesSection(selectedBuilding)
-                  : renderGeneralFacilitiesSection(
-                      selectedBuilding,
-                      buildingEvents,
-                      buildingProfessors
-                    )
-              }
-            </aside>
-          </div>
-
-          ${state.modal360.isOpen ? render360Modal(state) : ""}
         </section>
       `;
 
-      bindMapEvents(container, state);
-      if (state.modal360.isOpen) {
-        init360CanvasViewer(container, state);
+      bindTopbarEvents(container, state);
+
+      if (subMode === "interactive") {
+        renderSidebarContent(container, state);
+        renderDetailBottomCard(container, state);
+        initMapLibreEngine(container, state);
       }
     }
   };
 
-  function renderDascSalonesSection(building) {
-    const salones = building.salonesDasc || [];
-    const activeSalon =
-      salones.find((s) => s.codigo === selectedSalonCodeInPanel) || salones[0];
-    const sqlClassesInSalon = activeSalon
-      ? window.DASCStore.getClassesBySalonCodigo(activeSalon.codigo)
-      : [];
-
-    const uniqueSubjectsMap = new Map();
-    sqlClassesInSalon.forEach((row) => {
-      const key = `${row.materia_nombre}|${row.maestro_nombre}|${row.semestre}${row.turno[0]}${row.grupo}`;
-      if (!uniqueSubjectsMap.has(key)) {
-        uniqueSubjectsMap.set(key, row);
-      }
+  function updateHeaderModeButtons(container, subMode) {
+    container.querySelectorAll("[data-map-submode]").forEach((btn) => {
+      btn.classList.toggle("active", btn.getAttribute("data-map-submode") === subMode);
     });
-    const assignedClasses = Array.from(uniqueSubjectsMap.values());
+  }
+
+  function bindTopbarEvents(container, state) {
+    container.querySelectorAll("[data-map-submode]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const targetMode = btn.getAttribute("data-map-submode");
+        window.DASCStore.setMapSubMode(targetMode);
+      });
+    });
+
+    const arBtn = container.querySelector("#btn-map-topbar-ar");
+    if (arBtn) {
+      arBtn.addEventListener("click", () => {
+        const sel = state.mapSelection || {};
+        const bldg = window.DASCStore.getBuildingById(sel.buildingId || "dsc-39");
+        window.DASCStore.openARGuide({
+          buildingId: bldg ? bldg.id : "dsc-39",
+          destinationLabel: sel.highlightRoom || (bldg ? bldg.name : "Edificio DSC-39"),
+          aulaId: sel.aulaId || sel.highlightRoom
+        });
+      });
+    }
+  }
+
+  // =========================================================================
+  // MAPA INTERACTIVO 2D / 3D (GOOGLE SATÉLITE + MAPLIBRE 3D + RUTAS)
+  // =========================================================================
+  function renderInteractiveMapLayout() {
+    const puntosAcceso = (window.CAMPUS_RUTAS && window.CAMPUS_RUTAS.puntosAcceso) || [];
 
     return `
-      <div class="dasc-salones-panel">
-        <div class="salones-panel-header">
-          <span class="entity-tag emerald">SALONES Y LABORATORIOS DASC (${salones.length})</span>
-          <h4>Haz clic en un salón de ${escapeHtml(building.code)} para ver su info y clases SQL:</h4>
+      <div class="map-interactive-grid">
+        <!-- Panel Lateral Izquierdo: Buscador, Salones DASC (23), Edificios Campus (49) y Eventos -->
+        <aside class="map-pro-sidebar">
+          <div class="map-sidebar-tabs" role="tablist">
+            <button type="button" class="sidebar-tab-btn ${activeSidebarTab === "dasc" ? "active" : ""}" data-side-tab="dasc">
+              <i class="bi bi-cpu-fill"></i>
+              <span>Aulas DASC (23)</span>
+            </button>
+            <button type="button" class="sidebar-tab-btn ${activeSidebarTab === "campus" ? "active" : ""}" data-side-tab="campus">
+              <i class="bi bi-buildings-fill"></i>
+              <span>Campus (49)</span>
+            </button>
+            <button type="button" class="sidebar-tab-btn ${activeSidebarTab === "eventos" ? "active" : ""}" data-side-tab="eventos">
+              <i class="bi bi-calendar-event-fill"></i>
+              <span>Eventos</span>
+            </button>
+          </div>
+
+          <!-- Buscador Inteligente -->
+          <div class="map-sidebar-search">
+            <i class="bi bi-search search-icon"></i>
+            <input
+              type="search"
+              id="map-pro-search-input"
+              placeholder="Buscar salón (LAB A, SC2-JAVA, LR), edificio o clave..."
+              value="${escapeHtml(searchQuery)}"
+            />
+          </div>
+
+          <!-- Calculadora de Ruta Peatonal en el Campus -->
+          <div class="map-route-planner-box">
+            <div class="route-planner-head">
+              <span><i class="bi bi-sign-turn-right-fill"></i> Ruteo Peatonal Campus</span>
+              <button type="button" class="btn-gps-origin" id="btn-use-real-gps" title="Usar mi ubicación GPS actual">
+                <i class="bi bi-crosshair"></i> Mi GPS
+              </button>
+            </div>
+            <div class="route-planner-controls">
+              <label for="select-route-origin">Desde:</label>
+              <select id="select-route-origin">
+                <option value="gps" ${activeRouteOrigin === "gps" ? "selected" : ""}>📍 Mi Ubicación GPS en Vivo</option>
+                <option value="click" ${activeRouteOrigin === "click" ? "selected" : ""}>🎯 Seleccionar en el mapa (Clic)</option>
+                ${puntosAcceso
+                  .map(
+                    (p) => `
+                  <option value="${escapeHtml(p.id)}" ${activeRouteOrigin === p.id ? "selected" : ""}>
+                    ${escapeHtml(p.nombre)}
+                  </option>
+                `
+                  )
+                  .join("")}
+              </select>
+              <button type="button" class="btn-clear-route" id="btn-clear-map-route" title="Limpiar ruta trazada" style="${currentRouteData ? "" : "display:none;"}">
+                ✕
+              </button>
+            </div>
+            <div id="map-route-summary-banner" class="map-route-summary-banner" style="${currentRouteData ? "" : "display:none;"}">
+              ${
+                currentRouteData
+                  ? `<strong>${currentRouteData.distanciaM} m</strong> · ~${currentRouteData.tiempoMin} min caminando hacia <span>${escapeHtml(currentRouteData.destinoNombre || "Destino")}</span>`
+                  : ""
+              }
+            </div>
+          </div>
+
+          <!-- Lista Dinámica de Elementos -->
+          <div id="map-sidebar-list-container" class="map-sidebar-list"></div>
+        </aside>
+
+        <!-- Columna Derecha: Viewport Cartográfico MapLibre GL + Controles Flotantes + Ficha Inferior -->
+        <div class="map-pro-main-col">
+          <div class="map-canvas-wrapper">
+            <div id="dasc-maplibre-canvas" class="dasc-maplibre-canvas"></div>
+
+            <!-- Banner Flotante de Estado GPS / Ubicación en Tiempo Real -->
+            <div id="map-gps-banner" class="map-gps-banner" style="display: none;"></div>
+
+            <!-- Barra Superior Flotante: Selector de Mapa Base (Google Satélite, Google Calles, Vector Oscuro/Claro) -->
+            <div class="map-floating-basemaps">
+              <button type="button" class="basemap-pill ${activeBaseStyle === "satelite" ? "active" : ""}" data-base-style="satelite">
+                <i class="bi bi-globe-americas"></i> Google Satélite + 3D
+              </button>
+              <button type="button" class="basemap-pill ${activeBaseStyle === "google_calles" ? "active" : ""}" data-base-style="google_calles">
+                <i class="bi bi-map-fill"></i> Google Calles + 3D
+              </button>
+              <button type="button" class="basemap-pill ${activeBaseStyle === "oscuro" ? "active" : ""}" data-base-style="oscuro">
+                <i class="bi bi-moon-stars-fill"></i> Vector 3D Oscuro
+              </button>
+              <button type="button" class="basemap-pill ${activeBaseStyle === "claro" ? "active" : ""}" data-base-style="claro">
+                <i class="bi bi-sun-fill"></i> Vector 3D Claro
+              </button>
+            </div>
+
+            <!-- Barra Flotante Izquierda: Herramientas (Mi Ubicación GPS, Aulas DASC, Paleta SIIA, Eventos, Rotar, Centrar DASC) -->
+            <div class="map-floating-tools">
+              <button type="button" class="map-tool-chip btn-locate-chip" id="btn-map-locate-me" title="Localizar mi ubicación GPS en vivo en el mapa">
+                <i class="bi bi-crosshair"></i> Mi Ubicación GPS
+              </button>
+              <button type="button" class="map-tool-chip ${showAulaPins ? "active" : ""}" id="btn-toggle-aula-pins" title="Mostrar/Ocultar los 23 pines de laboratorios y salones del DASC">
+                <i class="bi bi-geo-alt-fill"></i> Aulas DASC (23)
+              </button>
+              <button type="button" class="map-tool-chip ${usePaletaSIIA ? "active" : ""}" id="btn-toggle-paleta-siia" title="Alternar entre Acabados Arquitectónicos SIIA y Colores por Área">
+                <i class="bi bi-palette2"></i> ${usePaletaSIIA ? "Acabados SIIA" : "Color por Área"}
+              </button>
+              <button type="button" class="map-tool-chip ${showEventPins ? "active" : ""}" id="btn-toggle-event-pins" title="Mostrar/Ocultar pines de eventos y talleres">
+                <i class="bi bi-stars"></i> Eventos
+              </button>
+              <button type="button" class="map-tool-chip" id="btn-fly-dasc-zone" title="Enfocar zona de edificios de Sistemas (DSC-39 y DSC-46)">
+                <i class="bi bi-cpu"></i> Zona DASC
+              </button>
+              <button type="button" class="map-tool-chip" id="btn-fly-full-campus" title="Ver todo el Campus La Paz UABCS">
+                <i class="bi bi-arrows-fullscreen"></i> Todo el Campus
+              </button>
+              <button type="button" class="map-tool-chip ${isRotating360 ? "active" : ""}" id="btn-rotate-360-map" title="Rotación orbital automática 360°">
+                <i class="bi bi-arrow-repeat"></i> Girar 360°
+              </button>
+            </div>
+
+            <!-- Control Flotante de Profundidad 2D ⟷ 3D (Scroll o Slider) -->
+            <div class="map-depth-widget" id="map-depth-widget" title="Usa el deslizador o Alt + Rueda del ratón para controlar la extrusión e inclinación 3D">
+              <div class="depth-widget-top">
+                <span class="depth-widget-title">
+                  <i class="bi bi-layers-half"></i> PROFUNDIDAD 2D ⟷ 3D
+                </span>
+                <span class="depth-widget-badge" id="map-depth-badge">${depthPct}% · ${depthPct === 0 ? "2D PLANO" : "3D SIIA"}</span>
+              </div>
+              <div class="depth-slider-line">
+                <span class="depth-lbl">2D</span>
+                <input type="range" id="dasc-depth-slider" min="0" max="100" step="1" value="${depthPct}" />
+                <span class="depth-lbl">3D</span>
+              </div>
+              <div class="depth-presets">
+                <button type="button" class="depth-preset-btn ${depthPct === 0 ? "active" : ""}" data-depth-val="0">2D Plano</button>
+                <button type="button" class="depth-preset-btn ${depthPct > 0 && depthPct < 80 ? "active" : ""}" data-depth-val="50">Semi 3D</button>
+                <button type="button" class="depth-preset-btn ${depthPct >= 80 ? "active" : ""}" data-depth-val="100">3D Máx</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Ficha Inferior de Detalle del Edificio / Salón Seleccionado + Clases SQL -->
+          <div id="map-bottom-detail-card" class="map-bottom-detail-card"></div>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderSidebarContent(container, state) {
+    const listEl = container.querySelector("#map-sidebar-list-container");
+    if (!listEl) return;
+
+    const sel = state.mapSelection || {};
+    const q = searchQuery.trim().toLowerCase();
+
+    if (activeSidebarTab === "dasc") {
+      const aulas = (window.AULAS_DASC && window.AULAS_DASC.salones) || [];
+      const filteredAulas = aulas.filter((a) => {
+        const matchPlanta =
+          selectedPlantaFilter === "all" ||
+          String(a.planta).toLowerCase().includes(selectedPlantaFilter.toLowerCase()) ||
+          String(a.edificioCodigo).toLowerCase() === selectedPlantaFilter.toLowerCase();
+        const matchQ =
+          !q ||
+          a.codigo.toLowerCase().includes(q) ||
+          a.nombre.toLowerCase().includes(q) ||
+          a.edificioCodigo.toLowerCase().includes(q) ||
+          a.tipo.toLowerCase().includes(q);
+        return matchPlanta && matchQ;
+      });
+
+      listEl.innerHTML = `
+        <div class="sidebar-filter-chips">
+          <button type="button" class="mini-filter-chip ${selectedPlantaFilter === "all" ? "active" : ""}" data-planta-filter="all">Todos (${aulas.length})</button>
+          <button type="button" class="mini-filter-chip ${selectedPlantaFilter === "DSC-39" ? "active" : ""}" data-planta-filter="DSC-39">DSC-39</button>
+          <button type="button" class="mini-filter-chip ${selectedPlantaFilter === "DSC-46" ? "active" : ""}" data-planta-filter="DSC-46">DSC-46</button>
+          <button type="button" class="mini-filter-chip ${selectedPlantaFilter === "Planta Baja" ? "active" : ""}" data-planta-filter="Planta Baja">P. Baja</button>
+          <button type="button" class="mini-filter-chip ${selectedPlantaFilter === "Planta Alta" ? "active" : ""}" data-planta-filter="Planta Alta">P. Alta</button>
         </div>
 
-        <div class="salones-Interactive-grid">
-          ${salones
-            .map((s) => {
-              const isSelected = activeSalon && s.codigo === activeSalon.codigo;
+        <div class="sidebar-items-stack">
+          ${filteredAulas
+            .map((aula) => {
+              const isSelected =
+                sel.aulaId === aula.id ||
+                (sel.highlightRoom &&
+                  String(sel.highlightRoom).toUpperCase().includes(aula.codigo.toUpperCase()));
+              const classesInRoom = window.DASCStore.getClassesBySalonCodigo(aula.codigo);
+
               return `
-                <button
-                  type="button"
-                  class="salon-pill-btn ${isSelected ? "active" : ""}"
-                  data-select-salon="${escapeHtml(s.codigo)}"
+                <article
+                  class="map-side-card ${isSelected ? "active" : ""}"
+                  data-select-aula="${escapeHtml(aula.id)}"
+                  data-aula-bldg="${escapeHtml(aula.edificioLegacy)}"
                 >
-                  <span class="salon-pill-code">${escapeHtml(s.codigo)}</span>
-                  <span class="salon-pill-type">${escapeHtml(s.tipo)}</span>
-                </button>
+                  <div class="side-card-top">
+                    <span class="side-code-badge" style="background:${escapeHtml(aula.color)};">${escapeHtml(aula.codigo)}</span>
+                    <span class="side-meta-pill">${escapeHtml(aula.edificioCodigo)} · ${escapeHtml(aula.planta)}</span>
+                  </div>
+                  <h4>${escapeHtml(aula.nombre)}</h4>
+                  <p>${escapeHtml(aula.tipo)} · Cap. ${aula.capacidad} alumnos · ${classesInRoom.length} bloques SQL</p>
+                  <div class="side-card-actions">
+                    <button type="button" class="btn-mini-map" data-route-aula="${escapeHtml(aula.id)}" title="Trazar ruta peatonal hasta este salón">
+                      <i class="bi bi-sign-turn-right"></i> Ruta
+                    </button>
+                    <button type="button" class="btn-mini-map ar" data-ar-aula="${escapeHtml(aula.id)}" title="Guiarme con Cámara AR + GPS">
+                      <i class="bi bi-compass"></i> AR
+                    </button>
+                  </div>
+                </article>
               `;
             })
             .join("")}
         </div>
+      `;
+    } else if (activeSidebarTab === "campus") {
+      const edificios =
+        (window.CAMPUS && window.CAMPUS.edificios.filter((e) => !e.esVialidad)) || [];
+      const cats = (window.CAMPUS && window.CAMPUS.categorias) || {};
 
-        ${
-          activeSalon
-            ? `
-          <div class="salon-detail-card">
-            <div class="salon-detail-top">
-              <div>
-                <span class="salon-floor-badge">${escapeHtml(activeSalon.planta)} · ${escapeHtml(activeSalon.tipo)}</span>
-                <h5>${escapeHtml(activeSalon.codigo)} — ${escapeHtml(activeSalon.nombre)}</h5>
-              </div>
-            </div>
-            <p class="salon-detail-desc">${escapeHtml(activeSalon.detalle)}</p>
+      const filteredEd = edificios.filter((e) => {
+        const matchCat = selectedCampusCat === "todas" || e.categoria === selectedCampusCat;
+        const matchQ =
+          !q ||
+          e.nombre.toLowerCase().includes(q) ||
+          String(e.codigoMapa || "").toLowerCase().includes(q) ||
+          String(e.descripcion || "").toLowerCase().includes(q);
+        return matchCat && matchQ;
+      });
 
-            <div class="salon-sql-classes">
-              <span class="salon-sql-title">
-                Clases registradas en SQL en este salón (${assignedClasses.length} grupos/materias):
-              </span>
-              ${
-                assignedClasses.length > 0
-                  ? `
-                <div class="salon-sql-list">
-                  ${assignedClasses
-                    .slice(0, 6)
-                    .map(
-                      (c) => `
-                    <div class="salon-sql-item">
-                      <strong>${escapeHtml(c.materia_nombre)} (${escapeHtml(c.semestre)}° ${escapeHtml(c.turno === "Matutino" ? "TM" : "TV")}-${escapeHtml(c.grupo)})</strong>
-                      <span>Maestro: ${escapeHtml(c.maestro_nombre)}</span>
-                    </div>
-                  `
-                    )
-                    .join("")}
-                </div>
-              `
-                  : `<p class="salon-sql-empty">Espacio de uso general / eventos académicos del DASC.</p>`
-              }
-            </div>
-          </div>
-        `
-            : ""
-        }
-
-        <div class="building-info-block" style="margin-top: 0.75rem;">
-          <h4>Otros Espacios en ${escapeHtml(building.code)}</h4>
-          <div class="facility-chips-grid">
-            ${(building.facilities || [])
-              .map(
-                (fac) => `
-              <span class="facility-chip" title="${escapeHtml(fac)}">
-                ${escapeHtml(fac)}
-              </span>
-            `
-              )
-              .join("")}
-          </div>
-        </div>
-      </div>
-    `;
-  }
-
-  function renderGeneralFacilitiesSection(
-    selectedBuilding,
-    buildingEvents,
-    buildingProfessors
-  ) {
-    return `
-      <div class="building-info-block">
-        <h4>Áreas y Referencias en ${escapeHtml(selectedBuilding.code)} (${selectedBuilding.facilities.length})</h4>
-        <div class="facility-chips-grid">
-          ${selectedBuilding.facilities
+      listEl.innerHTML = `
+        <div class="sidebar-filter-chips">
+          ${Object.entries(cats)
             .map(
-              (fac) => `
-            <span class="facility-chip" title="${escapeHtml(fac)}">
-              ${escapeHtml(fac)}
-            </span>
+              ([key, info]) => `
+            <button type="button" class="mini-filter-chip ${selectedCampusCat === key ? "active" : ""}" data-campus-cat="${escapeHtml(key)}">
+              ${escapeHtml(info.label)}
+            </button>
           `
             )
             .join("")}
         </div>
-      </div>
 
-      <div class="building-compact-stats">
-        <div class="compact-stat-pill">
-          <span class="stat-num">${buildingEvents.length}</span>
-          <span class="stat-lbl">${buildingEvents.length === 1 ? "Evento vinculado" : "Eventos vinculados"}</span>
+        <div class="sidebar-items-stack">
+          ${filteredEd
+            .map((ed) => {
+              const isSelected = sel.campusId === ed.id || sel.buildingId === ed.id;
+              return `
+                <article
+                  class="map-side-card with-thumb ${isSelected ? "active" : ""}"
+                  data-select-campus-bldg="${escapeHtml(ed.id)}"
+                >
+                  <img src="${escapeHtml(ed.imagen || "./img/uabcs.jpg")}" alt="${escapeHtml(ed.nombre)}" class="side-card-thumb" loading="lazy" onerror="this.src='./img/uabcs.jpg'" />
+                  <div class="side-card-body">
+                    <div class="side-card-top">
+                      <span class="side-code-badge" style="background:${escapeHtml(ed.color)};">${escapeHtml(ed.codigoMapa || "UABCS")}</span>
+                      <span class="side-meta-pill">${ed.pisos || 1} Niv. · ${ed.alturaM || 5}m</span>
+                    </div>
+                    <h4>${escapeHtml(ed.nombre)}</h4>
+                    <p>${escapeHtml(String(ed.descripcion || "").slice(0, 82))}...</p>
+                    <div class="side-card-actions">
+                      <button type="button" class="btn-mini-map" data-route-bldg="${escapeHtml(ed.id)}">
+                        <i class="bi bi-sign-turn-right"></i> Ruta
+                      </button>
+                      <button type="button" class="btn-mini-map ar" data-ar-bldg="${escapeHtml(ed.id)}">
+                        <i class="bi bi-compass"></i> AR
+                      </button>
+                    </div>
+                  </div>
+                </article>
+              `;
+            })
+            .join("")}
         </div>
-        <div class="compact-stat-pill">
-          <span class="stat-num">${buildingProfessors.length}</span>
-          <span class="stat-lbl">Representantes en sede</span>
+      `;
+    } else {
+      const eventos =
+        (window.EVENTOS_UABCS && window.EVENTOS_UABCS.lista) || state.events || [];
+      listEl.innerHTML = `
+        <div class="sidebar-items-stack">
+          ${eventos
+            .map(
+              (ev) => `
+            <article class="map-side-card" data-select-event="${escapeHtml(ev.id)}" data-event-bldg="${escapeHtml(ev.edificioId || ev.buildingId || "dasc")}">
+              <div class="side-card-top">
+                <span class="side-code-badge" style="background:${escapeHtml(ev.colorBadge || "#F59E0B")};">${escapeHtml(ev.categoriaLabel || ev.category || "Evento")}</span>
+                <span class="side-meta-pill">${escapeHtml(ev.horaTexto || ev.date || "")}</span>
+              </div>
+              <h4>${escapeHtml(ev.titulo || ev.title)}</h4>
+              <p><i class="bi bi-geo-alt-fill"></i> ${escapeHtml(ev.lugarNombre || ev.locationDetail)}</p>
+            </article>
+          `
+            )
+            .join("")}
         </div>
-      </div>
-    `;
+      `;
+    }
+
+    bindSidebarDynamicEvents(container, state);
   }
 
-  function render360Modal(state) {
-    const building =
-      window.DASCStore.getBuildingById(state.modal360.buildingId) ||
-      window.DASCStore.getBuildings()[0];
-    const pano = building.panorama360;
-    if (!pano) return "";
-    const activeScene =
-      pano.scenes.find((s) => s.id === state.modal360.sceneId) || pano.scenes[0];
+  function bindSidebarDynamicEvents(container, state) {
+    // Cambio de pestaña en sidebar
+    container.querySelectorAll("[data-side-tab]").forEach((btn) => {
+      btn.onclick = () => {
+        activeSidebarTab = btn.getAttribute("data-side-tab") || "dasc";
+        container.querySelectorAll("[data-side-tab]").forEach((b) =>
+          b.classList.toggle("active", b.getAttribute("data-side-tab") === activeSidebarTab)
+        );
+        renderSidebarContent(container, state);
+      };
+    });
 
-    return `
-      <div class="modal-360-backdrop" id="modal-360-backdrop" role="dialog" aria-modal="true" aria-label="${escapeHtml(pano.title)}">
-        <div class="modal-360-dialog">
-          <div class="modal-360-header">
-            <div>
-              <span class="badge-360-live">VISTA 360° INTERACTIVA · ${escapeHtml(building.code)}</span>
-              <h3>${escapeHtml(activeScene.name)}</h3>
-              <p>${escapeHtml(activeScene.subtitle)}</p>
-            </div>
-            <button type="button" class="btn-close-modal" id="btn-close-360" title="Cerrar recorrido 360°">✕</button>
+    // Buscador
+    const searchInput = container.querySelector("#map-pro-search-input");
+    if (searchInput) {
+      searchInput.oninput = (e) => {
+        searchQuery = e.target.value || "";
+        renderSidebarContent(container, state);
+      };
+    }
+
+    // Selector de origen de ruta
+    const originSel = container.querySelector("#select-route-origin");
+    if (originSel) {
+      originSel.onchange = (e) => {
+        activeRouteOrigin = e.target.value;
+        if (activeRouteOrigin === "gps") {
+          requestUserGpsForMap(container, state);
+        } else if (currentRouteData && currentRouteData.targetCoords) {
+          drawPedestrianRouteOnMap(
+            currentRouteData.targetCoords,
+            currentRouteData.destinoNombre,
+            container
+          );
+        }
+      };
+    }
+
+    const btnGpsOrigin = container.querySelector("#btn-use-real-gps");
+    if (btnGpsOrigin) {
+      btnGpsOrigin.onclick = () => {
+        activeRouteOrigin = "gps";
+        if (originSel) originSel.value = "gps";
+        requestUserGpsForMap(container, state);
+      };
+    }
+
+    const btnClearRoute = container.querySelector("#btn-clear-map-route");
+    if (btnClearRoute) {
+      btnClearRoute.onclick = () => {
+        clearPedestrianRouteOnMap(container);
+      };
+    }
+
+    // Filtros de planta DASC
+    container.querySelectorAll("[data-planta-filter]").forEach((btn) => {
+      btn.onclick = () => {
+        selectedPlantaFilter = btn.getAttribute("data-planta-filter") || "all";
+        renderSidebarContent(container, state);
+      };
+    });
+
+    // Filtros de categoría Campus
+    container.querySelectorAll("[data-campus-cat]").forEach((btn) => {
+      btn.onclick = () => {
+        selectedCampusCat = btn.getAttribute("data-campus-cat") || "todas";
+        renderSidebarContent(container, state);
+      };
+    });
+
+    // Selección de Aula DASC
+    container.querySelectorAll("[data-select-aula]").forEach((card) => {
+      card.onclick = (e) => {
+        if (e.target.closest("button")) return;
+        const aulaId = card.getAttribute("data-select-aula");
+        const aulaObj = window.AULAS_DASC && window.AULAS_DASC.buscar(aulaId);
+        if (aulaObj) {
+          window.DASCStore.focusBuildingOnMap({
+            buildingId: aulaObj.edificioLegacy,
+            highlightRoom: `${aulaObj.codigo} (${aulaObj.nombre})`,
+            aulaId: aulaObj.id
+          });
+        }
+      };
+    });
+
+    // Botones rápidos dentro de tarjeta de aula
+    container.querySelectorAll("[data-route-aula]").forEach((btn) => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        const aulaObj = window.AULAS_DASC && window.AULAS_DASC.buscar(btn.getAttribute("data-route-aula"));
+        if (aulaObj) {
+          window.DASCStore.selectBuildingInMap(aulaObj.edificioLegacy, `${aulaObj.codigo} (${aulaObj.nombre})`, aulaObj.id);
+          drawPedestrianRouteOnMap(aulaObj.coords, `${aulaObj.codigo} · ${aulaObj.nombre}`, container);
+        }
+      };
+    });
+
+    container.querySelectorAll("[data-ar-aula]").forEach((btn) => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        const aulaObj = window.AULAS_DASC && window.AULAS_DASC.buscar(btn.getAttribute("data-ar-aula"));
+        if (aulaObj) {
+          window.DASCStore.openARGuide({
+            buildingId: aulaObj.edificioLegacy,
+            destinationLabel: `${aulaObj.codigo} · ${aulaObj.nombre}`,
+            aulaId: aulaObj.id,
+            coords: aulaObj.coords
+          });
+        }
+      };
+    });
+
+    // Selección de Edificio del Campus
+    container.querySelectorAll("[data-select-campus-bldg]").forEach((card) => {
+      card.onclick = (e) => {
+        if (e.target.closest("button")) return;
+        const bldgId = card.getAttribute("data-select-campus-bldg");
+        window.DASCStore.focusBuildingOnMap({ buildingId: bldgId });
+      };
+    });
+
+    container.querySelectorAll("[data-route-bldg]").forEach((btn) => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        const bldgId = btn.getAttribute("data-route-bldg");
+        const bldg = window.DASCStore.getBuildingById(bldgId);
+        if (bldg && bldg.centro) {
+          window.DASCStore.selectBuildingInMap(bldg.id);
+          drawPedestrianRouteOnMap(bldg.centro, `${bldg.name} (${bldg.code})`, container);
+        }
+      };
+    });
+
+    container.querySelectorAll("[data-ar-bldg]").forEach((btn) => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        const bldgId = btn.getAttribute("data-ar-bldg");
+        const bldg = window.DASCStore.getBuildingById(bldgId);
+        if (bldg) {
+          window.DASCStore.openARGuide({
+            buildingId: bldg.id,
+            destinationLabel: `${bldg.name} (${bldg.code})`,
+            coords: bldg.centro
+          });
+        }
+      };
+    });
+
+    // Selección de Evento
+    container.querySelectorAll("[data-select-event]").forEach((card) => {
+      card.onclick = () => {
+        const bldgId = card.getAttribute("data-event-bldg") || "dasc";
+        window.DASCStore.focusBuildingOnMap({ buildingId: bldgId });
+      };
+    });
+  }
+
+  function renderDetailBottomCard(container, state) {
+    const detailEl = container.querySelector("#map-bottom-detail-card");
+    if (!detailEl) return;
+
+    const sel = state.mapSelection || {};
+    const selectedBldg =
+      window.DASCStore.getBuildingById(sel.buildingId || sel.campusId || "dsc-39") ||
+      window.DASCStore.getBuildings()[0];
+
+    const matchedAula =
+      window.AULAS_DASC && (sel.aulaId || sel.highlightRoom)
+        ? window.AULAS_DASC.buscar(sel.aulaId || sel.highlightRoom)
+        : null;
+
+    const salonCodeForSql = matchedAula
+      ? matchedAula.codigo
+      : sel.highlightRoom
+      ? String(sel.highlightRoom).split("(")[0].split("·")[0].trim()
+      : null;
+
+    const sqlClasses = salonCodeForSql
+      ? window.DASCStore.getClassesBySalonCodigo(salonCodeForSql)
+      : [];
+
+    detailEl.innerHTML = `
+      <div class="bottom-detail-inner">
+        <img
+          src="${escapeHtml(selectedBldg.imagen || "./img/recorrido/edificio-sistemas.jpg")}"
+          alt="${escapeHtml(selectedBldg.name)}"
+          class="bottom-detail-photo"
+          onerror="this.src='./img/uabcs.jpg'"
+        />
+
+        <div class="bottom-detail-info">
+          <div class="bottom-detail-badges">
+            <span class="bldg-code-pill" style="background:${escapeHtml(selectedBldg.color || "#3B82F6")};">
+              Clave SIIA: ${escapeHtml(selectedBldg.code)}
+            </span>
+            <span class="bldg-meta-pill">
+              <i class="bi bi-layers"></i> ${escapeHtml(selectedBldg.levels)} (${selectedBldg.alturaM || 7}m)
+            </span>
+            <span class="bldg-meta-pill">
+              <i class="bi bi-clock"></i> ${escapeHtml(selectedBldg.schedule)}
+            </span>
+            ${
+              matchedAula
+                ? `<span class="aula-highlight-pill"><i class="bi bi-geo-alt-fill"></i> Aula Activa: ${escapeHtml(matchedAula.codigo)} · ${escapeHtml(matchedAula.nombre)} (${escapeHtml(matchedAula.planta)})</span>`
+                : ""
+            }
           </div>
 
-          <div class="pano-canvas-container" id="pano-viewport">
-            <canvas id="pano-canvas-360" width="960" height="460"></canvas>
-            <div class="pano-hotspots-layer" id="pano-hotspots-layer"></div>
+          <h3>${escapeHtml(selectedBldg.name)}</h3>
+          <p>${escapeHtml(matchedAula ? matchedAula.referenciaAcceso : selectedBldg.description)}</p>
 
-            <div class="pano-hud-overlay">
-              <span class="pano-hint">Arrastra hacia los lados para girar 360°</span>
-              <div class="pano-controls-bar">
-                <button type="button" class="btn-pano-ctrl" id="btn-pano-left">◀ Girar Izq</button>
-                <button type="button" class="btn-pano-ctrl ${autoRotate360 ? "active" : ""}" id="btn-pano-autorotate">
-                  ${autoRotate360 ? "⏸ Pausar Giro" : "▶ Giro Automático"}
-                </button>
-                <button type="button" class="btn-pano-ctrl" id="btn-pano-right">Girar Der ▶</button>
+          ${
+            sqlClasses.length > 0
+              ? `
+            <div class="bottom-sql-classes-strip">
+              <span class="sql-strip-label"><i class="bi bi-database-check"></i> Clases SQL en ${escapeHtml(salonCodeForSql)} (${sqlClasses.length}):</span>
+              <div class="sql-strip-chips">
+                ${sqlClasses
+                  .slice(0, 4)
+                  .map(
+                    (c) => `
+                  <span class="sql-mini-chip">
+                    <strong>${escapeHtml(c.materia_nombre)}</strong> (${c.semestre}° ${escapeHtml(c.turno.slice(0, 3))}-${escapeHtml(c.grupo)} · ${escapeHtml(c.dia.slice(0, 3))})
+                  </span>
+                `
+                  )
+                  .join("")}
               </div>
             </div>
-          </div>
+          `
+              : ""
+          }
+        </div>
 
-          <div class="modal-360-footer">
-            <span class="scene-selector-label">Espacios en ${escapeHtml(building.shortName)}:</span>
-            <div class="scene-chips">
-              ${pano.scenes
-                .map(
-                  (sc) => `
-                <button
-                  type="button"
-                  class="scene-chip-btn ${sc.id === activeScene.id ? "active" : ""}"
-                  data-scene-id="${escapeHtml(sc.id)}"
-                >
-                  ${escapeHtml(sc.name)}
-                </button>
-              `
-                )
-                .join("")}
+        <div class="bottom-detail-actions">
+          <button type="button" class="btn-primary btn-sm-action" id="btn-detail-draw-route">
+            <i class="bi bi-sign-turn-right-fill"></i>
+            <span>Trazar Ruta Peatonal</span>
+          </button>
+          <button type="button" class="btn-action-ar btn-sm-action" id="btn-detail-open-ar">
+            <i class="bi bi-compass-fill"></i>
+            <span>Guía Cámara AR + GPS</span>
+          </button>
+        </div>
+      </div>
+    `;
+
+    const targetCoords =
+      (matchedAula && matchedAula.coords) || selectedBldg.centro || [24.10275, -110.31602];
+    const targetLabel = matchedAula
+      ? `${matchedAula.codigo} · ${matchedAula.nombre}`
+      : `${selectedBldg.name} (${selectedBldg.code})`;
+
+    const routeBtn = detailEl.querySelector("#btn-detail-draw-route");
+    if (routeBtn) {
+      routeBtn.onclick = () => {
+        drawPedestrianRouteOnMap(targetCoords, targetLabel, container);
+      };
+    }
+
+    const arBtn = detailEl.querySelector("#btn-detail-open-ar");
+    if (arBtn) {
+      arBtn.onclick = () => {
+        window.DASCStore.openARGuide({
+          buildingId: selectedBldg.id,
+          destinationLabel: targetLabel,
+          aulaId: matchedAula ? matchedAula.id : null,
+          coords: targetCoords
+        });
+      };
+    }
+  }
+
+  // =========================================================================
+  // MOTOR MAPLIBRE GL 2D / 3D SIIA + CAPAS GOOGLE SATÉLITE / CALLES
+  // =========================================================================
+  function initMapLibreEngine(container, state) {
+    const mapCanvas = container.querySelector("#dasc-maplibre-canvas");
+    if (!mapCanvas || typeof maplibregl === "undefined") return;
+
+    const sel = state.mapSelection || {};
+    const initialBldg =
+      window.DASCStore.getBuildingById(sel.buildingId || "dsc-39") ||
+      window.DASCStore.getBuildings()[0];
+    const initialCenter = initialBldg.centro
+      ? [initialBldg.centro[1], initialBldg.centro[0]]
+      : [-110.31595, 24.10255];
+
+    const styleConf = BASE_STYLES[activeBaseStyle] || BASE_STYLES.satelite;
+    const initialStyle =
+      styleConf.type === "raster" ? getRasterStyleObject(styleConf.tiles) : styleConf.url;
+
+    mapInstance = new maplibregl.Map({
+      container: mapCanvas,
+      style: initialStyle,
+      center: initialCenter,
+      zoom: 17.6,
+      pitch: Math.round((depthPct / 100) * 58),
+      bearing: -20,
+      antialias: true,
+      maxPitch: 65
+    });
+
+    mapInstance.addControl(
+      new maplibregl.NavigationControl({ visualizePitch: true }),
+      "bottom-right"
+    );
+
+    const geolocateCtrl = new maplibregl.GeolocateControl({
+      positionOptions: { enableHighAccuracy: true, timeout: 15000 },
+      trackUserLocation: true,
+      showUserLocation: true,
+      showAccuracyCircle: true
+    });
+    mapInstance.addControl(geolocateCtrl, "bottom-right");
+
+    geolocateCtrl.on("geolocate", (e) => {
+      handleUserGpsSuccess(e.coords.latitude, e.coords.longitude, e.coords.accuracy, container);
+    });
+
+    geolocateCtrl.on("error", (err) => {
+      handleUserGpsError(err, container);
+    });
+
+    mapInstance.on("load", () => {
+      mapLoaded = true;
+      addCampus3DLayers();
+      renderAulaMarkersOnMap(container);
+      renderEventMarkersOnMap(container);
+      apply3DDepthFactor(depthPct, false, container);
+
+      const latestState = window.DASCStore.getState();
+      if (latestState.mapSelection && latestState.mapSelection.autoTriggered) {
+        focusSelectedTargetOnMap(latestState);
+      }
+    });
+
+    // Eventos de barra de estilos base
+    container.querySelectorAll("[data-base-style]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const styleKey = btn.getAttribute("data-base-style");
+        if (!BASE_STYLES[styleKey] || styleKey === activeBaseStyle) return;
+        activeBaseStyle = styleKey;
+        container.querySelectorAll("[data-base-style]").forEach((b) =>
+          b.classList.toggle("active", b.getAttribute("data-base-style") === activeBaseStyle)
+        );
+        const nextStyle =
+          BASE_STYLES[styleKey].type === "raster"
+            ? getRasterStyleObject(BASE_STYLES[styleKey].tiles)
+            : BASE_STYLES[styleKey].url;
+        mapInstance.setStyle(nextStyle);
+        mapInstance.once("styledata", () => {
+          setTimeout(() => {
+            addCampus3DLayers();
+            apply3DDepthFactor(depthPct, false, container);
+            if (currentRouteData) {
+              renderRouteGeoJsonLayer(currentRouteData.waypoints);
+            }
+          }, 180);
+        });
+      });
+    });
+
+    // Eventos de herramientas flotantes
+    const btnLocateMe = container.querySelector("#btn-map-locate-me");
+    if (btnLocateMe) {
+      btnLocateMe.addEventListener("click", () => {
+        activeRouteOrigin = "gps";
+        const originSel = container.querySelector("#select-route-origin");
+        if (originSel) originSel.value = "gps";
+        requestUserGpsForMap(container, window.DASCStore.getState());
+      });
+    }
+
+    const btnAulaPins = container.querySelector("#btn-toggle-aula-pins");
+    if (btnAulaPins) {
+      btnAulaPins.addEventListener("click", () => {
+        showAulaPins = !showAulaPins;
+        btnAulaPins.classList.toggle("active", showAulaPins);
+        renderAulaMarkersOnMap(container);
+      });
+    }
+
+    const btnPaleta = container.querySelector("#btn-toggle-paleta-siia");
+    if (btnPaleta) {
+      btnPaleta.addEventListener("click", () => {
+        usePaletaSIIA = !usePaletaSIIA;
+        btnPaleta.classList.toggle("active", usePaletaSIIA);
+        btnPaleta.innerHTML = `<i class="bi bi-palette2"></i> ${
+          usePaletaSIIA ? "Acabados SIIA" : "Color por Área"
+        }`;
+        if (mapInstance && mapInstance.getLayer("uabcs-edificios-3d")) {
+          mapInstance.setPaintProperty(
+            "uabcs-edificios-3d",
+            "fill-extrusion-color",
+            usePaletaSIIA ? ["get", "colorSIIA"] : ["get", "color"]
+          );
+        }
+      });
+    }
+
+    const btnEvents = container.querySelector("#btn-toggle-event-pins");
+    if (btnEvents) {
+      btnEvents.addEventListener("click", () => {
+        showEventPins = !showEventPins;
+        btnEvents.classList.toggle("active", showEventPins);
+        renderEventMarkersOnMap(container);
+      });
+    }
+
+    const btnFlyDasc = container.querySelector("#btn-fly-dasc-zone");
+    if (btnFlyDasc) {
+      btnFlyDasc.addEventListener("click", () => {
+        stopRotation360();
+        mapInstance.flyTo({
+          center: [-110.31602, 24.10275],
+          zoom: 18.8,
+          pitch: Math.max(45, Math.round((depthPct / 100) * 58)),
+          bearing: -18,
+          duration: 1200
+        });
+      });
+    }
+
+    const btnFlyCampus = container.querySelector("#btn-fly-full-campus");
+    if (btnFlyCampus) {
+      btnFlyCampus.addEventListener("click", () => {
+        stopRotation360();
+        mapInstance.flyTo({
+          center: [-110.31595, 24.10245],
+          zoom: 16.5,
+          pitch: Math.round((depthPct / 100) * 52),
+          bearing: -15,
+          duration: 1200
+        });
+      });
+    }
+
+    const btnRotate = container.querySelector("#btn-rotate-360-map");
+    if (btnRotate) {
+      btnRotate.addEventListener("click", () => {
+        if (isRotating360) {
+          stopRotation360();
+          btnRotate.classList.remove("active");
+        } else {
+          isRotating360 = true;
+          btnRotate.classList.add("active");
+          const spin = () => {
+            if (!isRotating360 || !mapInstance) return;
+            mapInstance.rotateTo((mapInstance.getBearing() + 0.18) % 360, { duration: 0 });
+            rotateAnimId = requestAnimationFrame(spin);
+          };
+          spin();
+        }
+      });
+    }
+
+    // Control de profundidad 2D <-> 3D (Slider, Presets y Rueda del Ratón)
+    const depthSlider = container.querySelector("#dasc-depth-slider");
+    if (depthSlider) {
+      depthSlider.addEventListener("input", (e) => {
+        apply3DDepthFactor(Number(e.target.value), true, container);
+      });
+    }
+
+    container.querySelectorAll("[data-depth-val]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const val = Number(btn.getAttribute("data-depth-val"));
+        apply3DDepthFactor(val, true, container);
+      });
+    });
+
+    const depthWidget = container.querySelector("#map-depth-widget");
+    if (depthWidget) {
+      depthWidget.addEventListener(
+        "wheel",
+        (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const step = e.deltaY < 0 ? 8 : -8;
+          apply3DDepthFactor(depthPct + step, false, container);
+        },
+        { passive: false }
+      );
+    }
+
+    mapCanvas.addEventListener(
+      "wheel",
+      (e) => {
+        if (!e.altKey) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const step = e.deltaY < 0 ? 8 : -8;
+        apply3DDepthFactor(depthPct + step, false, container);
+      },
+      { passive: false }
+    );
+  }
+
+  function addCampus3DLayers() {
+    if (!mapInstance || !window.CAMPUS) return;
+
+    const geojsonArq = window.CAMPUS.geojsonArquitecturaSIIA();
+    const geojsonUrb = window.CAMPUS.geojsonUrbanismoSIIA();
+    const geojsonEdificios = window.CAMPUS.geojson();
+    const geojsonLabels = window.CAMPUS.geojsonEtiquetas();
+
+    if (!mapInstance.getSource("uabcs-urbanismo-siia")) {
+      mapInstance.addSource("uabcs-urbanismo-siia", { type: "geojson", data: geojsonUrb });
+    }
+    if (!mapInstance.getSource("uabcs-campus")) {
+      mapInstance.addSource("uabcs-campus", { type: "geojson", data: geojsonEdificios });
+    }
+    if (!mapInstance.getSource("uabcs-arquitectura-siia")) {
+      mapInstance.addSource("uabcs-arquitectura-siia", { type: "geojson", data: geojsonArq });
+    }
+    if (!mapInstance.getSource("uabcs-labels")) {
+      mapInstance.addSource("uabcs-labels", { type: "geojson", data: geojsonLabels });
+    }
+
+    // 1. Urbanismo SIIA
+    if (!mapInstance.getLayer("uabcs-urbanismo-3d")) {
+      mapInstance.addLayer({
+        id: "uabcs-urbanismo-3d",
+        type: "fill-extrusion",
+        source: "uabcs-urbanismo-siia",
+        paint: {
+          "fill-extrusion-color": ["get", "colorSIIA"],
+          "fill-extrusion-height": ["get", "alturaM"],
+          "fill-extrusion-base": ["get", "baseM"],
+          "fill-extrusion-opacity": 0.9
+        }
+      });
+    }
+
+    // 2. Huella base y contorno de edificios
+    if (!mapInstance.getLayer("uabcs-edificios-footprint")) {
+      mapInstance.addLayer({
+        id: "uabcs-edificios-footprint",
+        type: "fill",
+        source: "uabcs-campus",
+        filter: ["!=", ["get", "esVialidad"], true],
+        paint: {
+          "fill-color": ["get", "color"],
+          "fill-opacity": 0.22
+        }
+      });
+    }
+
+    if (!mapInstance.getLayer("uabcs-edificios-outline")) {
+      mapInstance.addLayer({
+        id: "uabcs-edificios-outline",
+        type: "line",
+        source: "uabcs-campus",
+        filter: ["!=", ["get", "esVialidad"], true],
+        paint: {
+          "line-color": ["get", "color"],
+          "line-width": 2.2,
+          "line-opacity": 0.92
+        }
+      });
+    }
+
+    // 3. Volúmenes 3D SIIA Multi-cuerpo
+    if (!mapInstance.getLayer("uabcs-edificios-3d")) {
+      mapInstance.addLayer({
+        id: "uabcs-edificios-3d",
+        type: "fill-extrusion",
+        source: "uabcs-arquitectura-siia",
+        paint: {
+          "fill-extrusion-color": usePaletaSIIA ? ["get", "colorSIIA"] : ["get", "color"],
+          "fill-extrusion-height": ["get", "alturaM"],
+          "fill-extrusion-base": ["get", "baseM"],
+          "fill-extrusion-opacity": 0.94,
+          "fill-extrusion-vertical-gradient": true
+        }
+      });
+    }
+
+    // 4. Etiquetas de edificios con Clave SIIA
+    if (!mapInstance.getLayer("uabcs-edificios-labels")) {
+      mapInstance.addLayer({
+        id: "uabcs-edificios-labels",
+        type: "symbol",
+        source: "uabcs-labels",
+        minzoom: 15.8,
+        layout: {
+          "text-field": [
+            "format",
+            ["concat", "[", ["get", "codigoMapa"], "] "],
+            { "font-scale": 0.78 },
+            ["get", "nombre"],
+            { "font-scale": 0.9 }
+          ],
+          "text-size": ["interpolate", ["linear"], ["zoom"], 16, 10, 18.5, 13],
+          "text-anchor": "center",
+          "text-max-width": 11,
+          "text-allow-overlap": false
+        },
+        paint: {
+          "text-color": "#F8FAFC",
+          "text-halo-color": "rgba(15, 23, 42, 0.95)",
+          "text-halo-width": 2.2
+        }
+      });
+    }
+
+    // Clic sobre cualquier edificio 3D o huella 2D
+    const handleBuildingClick = (e) => {
+      if (!e.features || !e.features.length) return;
+      const props = e.features[0].properties;
+      if (props.esVialidad === true || props.esVialidad === "true") return;
+      const edId = props.id;
+      window.DASCStore.selectBuildingInMap(edId);
+      openBuildingPopupOnMap(edId, e.lngLat);
+    };
+
+    mapInstance.on("click", "uabcs-edificios-3d", handleBuildingClick);
+    mapInstance.on("click", "uabcs-edificios-footprint", handleBuildingClick);
+
+    mapInstance.on("mouseenter", "uabcs-edificios-3d", () => {
+      mapInstance.getCanvas().style.cursor = "pointer";
+    });
+    mapInstance.on("mouseleave", "uabcs-edificios-3d", () => {
+      mapInstance.getCanvas().style.cursor = "";
+    });
+
+    // Clic libre en el mapa para fijar ubicación cuando el origen es "click" o con Shift + Clic
+    mapInstance.on("click", (e) => {
+      if (activeRouteOrigin === "click" || e.originalEvent.shiftKey) {
+        handleUserGpsSuccess(e.lngLat.lat, e.lngLat.lng, 2, container);
+      }
+    });
+  }
+
+  function apply3DDepthFactor(newPct, animatePitch = false, container = document) {
+    depthPct = Math.max(0, Math.min(100, Math.round(Number(newPct) || 0)));
+    const factor = depthPct / 100;
+
+    const slider = container.querySelector("#dasc-depth-slider");
+    if (slider && Number(slider.value) !== depthPct) {
+      slider.value = depthPct;
+    }
+
+    const badge = container.querySelector("#map-depth-badge");
+    if (badge) {
+      badge.textContent = `${depthPct}% · ${
+        depthPct === 0 ? "2D PLANO" : depthPct < 55 ? "SEMI 3D" : "3D SIIA"
+      }`;
+    }
+
+    container.querySelectorAll("[data-depth-val]").forEach((btn) => {
+      const v = Number(btn.getAttribute("data-depth-val"));
+      const isMatch =
+        (v === 0 && depthPct === 0) ||
+        (v === 50 && depthPct > 0 && depthPct < 80) ||
+        (v === 100 && depthPct >= 80);
+      btn.classList.toggle("active", isMatch);
+    });
+
+    if (!mapInstance || !mapLoaded) return;
+
+    const targetPitch = Math.round(factor * 58);
+    if (animatePitch) {
+      mapInstance.easeTo({ pitch: targetPitch, duration: 280 });
+    } else {
+      mapInstance.setPitch(targetPitch);
+    }
+
+    if (mapInstance.getLayer("uabcs-edificios-3d")) {
+      mapInstance.setPaintProperty(
+        "uabcs-edificios-3d",
+        "fill-extrusion-height",
+        factor <= 0.01 ? 0 : ["*", ["get", "alturaM"], factor]
+      );
+      mapInstance.setPaintProperty(
+        "uabcs-edificios-3d",
+        "fill-extrusion-base",
+        factor <= 0.01 ? 0 : ["*", ["get", "baseM"], factor]
+      );
+      mapInstance.setPaintProperty(
+        "uabcs-edificios-3d",
+        "fill-extrusion-opacity",
+        factor <= 0.02 ? 0.0 : Math.min(0.95, 0.35 + factor * 0.6)
+      );
+    }
+
+    if (mapInstance.getLayer("uabcs-urbanismo-3d")) {
+      mapInstance.setPaintProperty(
+        "uabcs-urbanismo-3d",
+        "fill-extrusion-height",
+        factor <= 0.01 ? 0 : ["*", ["get", "alturaM"], factor]
+      );
+      mapInstance.setPaintProperty(
+        "uabcs-urbanismo-3d",
+        "fill-extrusion-base",
+        factor <= 0.01 ? 0 : ["*", ["get", "baseM"], factor]
+      );
+    }
+
+    if (mapInstance.getLayer("uabcs-edificios-footprint")) {
+      mapInstance.setPaintProperty(
+        "uabcs-edificios-footprint",
+        "fill-opacity",
+        factor <= 0.15 ? 0.58 : 0.22
+      );
+    }
+  }
+
+  function renderAulaMarkersOnMap(container) {
+    aulaMarkers.forEach((m) => m.remove());
+    aulaMarkers = [];
+
+    if (!showAulaPins || !mapInstance || !window.AULAS_DASC) return;
+
+    window.AULAS_DASC.salones.forEach((aula) => {
+      const el = document.createElement("button");
+      el.type = "button";
+      el.className = "dasc-aula-map-pin";
+      el.style.setProperty("--pin-color", aula.color || "#3B82F6");
+      el.innerHTML = `<i class="bi ${escapeHtml(aula.icono || "bi-pc-display")}"></i><span>${escapeHtml(aula.codigo)}</span>`;
+      el.title = `${aula.codigo} · ${aula.nombre} (${aula.edificioCodigo} - ${aula.planta})`;
+
+      el.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        window.DASCStore.focusBuildingOnMap({
+          buildingId: aula.edificioLegacy,
+          highlightRoom: `${aula.codigo} (${aula.nombre})`,
+          aulaId: aula.id
+        });
+        openAulaPopupOnMap(aula, container);
+      });
+
+      const marker = new maplibregl.Marker({ element: el, anchor: "bottom" })
+        .setLngLat([aula.coords[1], aula.coords[0]])
+        .addTo(mapInstance);
+
+      aulaMarkers.push(marker);
+    });
+  }
+
+  function renderEventMarkersOnMap(container) {
+    eventMarkers.forEach((m) => m.remove());
+    eventMarkers = [];
+
+    if (!showEventPins || !mapInstance || !window.EVENTOS_UABCS) return;
+
+    window.EVENTOS_UABCS.lista.forEach((ev) => {
+      if (!ev.coords) return;
+      const el = document.createElement("button");
+      el.type = "button";
+      el.className = "dasc-event-map-pin";
+      el.style.setProperty("--evt-color", ev.colorBadge || "#F59E0B");
+      el.innerHTML = `<i class="bi ${escapeHtml(ev.icono || "bi-stars")}"></i>`;
+      el.title = `${ev.titulo} · ${ev.lugarNombre}`;
+
+      el.addEventListener("click", (e) => {
+        e.stopPropagation();
+        if (currentPopup) currentPopup.remove();
+        currentPopup = new maplibregl.Popup({ maxWidth: "310px", offset: 16 })
+          .setLngLat([ev.coords[1], ev.coords[0]])
+          .setHTML(`
+            <div class="dasc-map-popup">
+              <div class="popup-head-badges">
+                <span class="popup-code-tag" style="background:${escapeHtml(ev.colorBadge || "#F59E0B")};">${escapeHtml(ev.categoriaLabel)}</span>
+                <span class="popup-floor-tag">${escapeHtml(ev.horaTexto)}</span>
+              </div>
+              <h4>${escapeHtml(ev.titulo)}</h4>
+              <p><strong>Sede:</strong> ${escapeHtml(ev.lugarNombre)}</p>
+              <p>${escapeHtml(ev.descripcion)}</p>
             </div>
+          `)
+          .addTo(mapInstance);
+      });
+
+      const marker = new maplibregl.Marker({ element: el, anchor: "center" })
+        .setLngLat([ev.coords[1], ev.coords[0]])
+        .addTo(mapInstance);
+
+      eventMarkers.push(marker);
+    });
+  }
+
+  function openAulaPopupOnMap(aula, container) {
+    if (!mapInstance) return;
+    if (currentPopup) currentPopup.remove();
+
+    const classesInRoom = window.DASCStore.getClassesBySalonCodigo(aula.codigo);
+    const popupHtml = `
+      <div class="dasc-map-popup">
+        <div class="popup-head-badges">
+          <span class="popup-code-tag" style="background:${escapeHtml(aula.color)};">${escapeHtml(aula.codigo)}</span>
+          <span class="popup-floor-tag">${escapeHtml(aula.edificioCodigo)} · ${escapeHtml(aula.planta)}</span>
+        </div>
+        <h4>${escapeHtml(aula.nombre)}</h4>
+        <p>${escapeHtml(aula.referenciaAcceso)}</p>
+        <div class="popup-equip-chips">
+          ${(aula.equipamiento || [])
+            .map((eq) => `<span>${escapeHtml(eq)}</span>`)
+            .join("")}
+        </div>
+        <div class="popup-sql-count">
+          <i class="bi bi-database-check"></i> ${classesInRoom.length} bloques de clase registrados en SQL
+        </div>
+        <div class="popup-btn-row-2">
+          <button type="button" class="popup-action-btn route" id="popup-btn-route-aula">
+            <i class="bi bi-sign-turn-right"></i> Ruta Peatonal
+          </button>
+          <button type="button" class="popup-action-btn ar" id="popup-btn-ar-aula">
+            <i class="bi bi-compass"></i> Guía AR
+          </button>
+        </div>
+      </div>
+    `;
+
+    currentPopup = new maplibregl.Popup({ maxWidth: "330px", offset: 18 })
+      .setLngLat([aula.coords[1], aula.coords[0]])
+      .setHTML(popupHtml)
+      .addTo(mapInstance);
+
+    setTimeout(() => {
+      const btnR = document.getElementById("popup-btn-route-aula");
+      if (btnR) {
+        btnR.onclick = () => {
+          drawPedestrianRouteOnMap(aula.coords, `${aula.codigo} · ${aula.nombre}`, container);
+        };
+      }
+      const btnA = document.getElementById("popup-btn-ar-aula");
+      if (btnA) {
+        btnA.onclick = () => {
+          window.DASCStore.openARGuide({
+            buildingId: aula.edificioLegacy,
+            destinationLabel: `${aula.codigo} · ${aula.nombre}`,
+            aulaId: aula.id,
+            coords: aula.coords
+          });
+        };
+      }
+    }, 40);
+  }
+
+  function openBuildingPopupOnMap(edId, lngLat) {
+    if (!mapInstance) return;
+    const bldg = window.DASCStore.getBuildingById(edId);
+    if (!bldg) return;
+
+    if (currentPopup) currentPopup.remove();
+    const coords = lngLat || [bldg.centro[1], bldg.centro[0]];
+
+    const popupHtml = `
+      <div class="dasc-map-popup">
+        <img src="${escapeHtml(bldg.imagen || "./img/uabcs.jpg")}" alt="${escapeHtml(bldg.name)}" class="popup-photo" onerror="this.src='./img/uabcs.jpg'" />
+        <div class="popup-head-badges">
+          <span class="popup-code-tag" style="background:${escapeHtml(bldg.color)};">Clave: ${escapeHtml(bldg.code)}</span>
+          <span class="popup-floor-tag">${escapeHtml(bldg.levels)}</span>
+        </div>
+        <h4>${escapeHtml(bldg.name)}</h4>
+        <p>${escapeHtml(String(bldg.description || "").slice(0, 120))}...</p>
+        <div class="popup-btn-row-2">
+          <button type="button" class="popup-action-btn route" id="popup-btn-route-bldg">
+            <i class="bi bi-sign-turn-right"></i> Ruta Peatonal
+          </button>
+          <button type="button" class="popup-action-btn ar" id="popup-btn-ar-bldg">
+            <i class="bi bi-compass"></i> Guía AR
+          </button>
+        </div>
+      </div>
+    `;
+
+    currentPopup = new maplibregl.Popup({ maxWidth: "320px", offset: 16 })
+      .setLngLat(coords)
+      .setHTML(popupHtml)
+      .addTo(mapInstance);
+
+    setTimeout(() => {
+      const container = document.getElementById("dasc-map-pro-shell") || document;
+      const btnR = document.getElementById("popup-btn-route-bldg");
+      if (btnR) {
+        btnR.onclick = () => {
+          drawPedestrianRouteOnMap(bldg.centro, `${bldg.name} (${bldg.code})`, container);
+        };
+      }
+      const btnA = document.getElementById("popup-btn-ar-bldg");
+      if (btnA) {
+        btnA.onclick = () => {
+          window.DASCStore.openARGuide({
+            buildingId: bldg.id,
+            destinationLabel: `${bldg.name} (${bldg.code})`,
+            coords: bldg.centro
+          });
+        };
+      }
+    }, 40);
+  }
+
+  function focusSelectedTargetOnMap(state) {
+    if (!mapInstance || !mapLoaded) return;
+    stopRotation360();
+
+    const sel = state.mapSelection || {};
+    const matchedAula =
+      window.AULAS_DASC && (sel.aulaId || sel.highlightRoom)
+        ? window.AULAS_DASC.buscar(sel.aulaId || sel.highlightRoom)
+        : null;
+
+    if (matchedAula && matchedAula.coords) {
+      mapInstance.flyTo({
+        center: [matchedAula.coords[1], matchedAula.coords[0]],
+        zoom: 19.1,
+        pitch: Math.max(48, Math.round((depthPct / 100) * 58)),
+        bearing: -15,
+        duration: 1100
+      });
+      const container = document.getElementById("dasc-map-pro-shell") || document;
+      openAulaPopupOnMap(matchedAula, container);
+      return;
+    }
+
+    const bldg = window.DASCStore.getBuildingById(sel.buildingId || sel.campusId || "dsc-39");
+    if (bldg && bldg.centro) {
+      mapInstance.flyTo({
+        center: [bldg.centro[1], bldg.centro[0]],
+        zoom: 18.2,
+        pitch: Math.max(42, Math.round((depthPct / 100) * 58)),
+        bearing: -18,
+        duration: 1100
+      });
+      openBuildingPopupOnMap(bldg.id, [bldg.centro[1], bldg.centro[0]]);
+    }
+  }
+
+  // =========================================================================
+  // GESTIÓN Y TRAZADO DE GEOLOCALIZACIÓN GPS EN TIEMPO REAL
+  // =========================================================================
+  function showMapGpsBanner(msg, type = "info", duration = 6000, container = document) {
+    const banner = container.querySelector("#map-gps-banner");
+    if (!banner) return;
+    if (gpsBannerTimeout) clearTimeout(gpsBannerTimeout);
+    banner.className = `map-gps-banner ${type}`;
+    banner.innerHTML = msg;
+    banner.style.display = "flex";
+    if (duration > 0) {
+      gpsBannerTimeout = setTimeout(() => {
+        banner.style.display = "none";
+      }, duration);
+    }
+  }
+
+  function handleUserGpsSuccess(lat, lng, accuracy = 5, container = document) {
+    userGpsCoords = [lat, lng];
+    const acc = Math.round(accuracy || 5);
+    const originSel = container.querySelector("#select-route-origin");
+
+    // Actualizar o crear marcador azul de usuario en MapLibre
+    if (mapInstance) {
+      if (!userLocationMarker) {
+        const el = document.createElement("div");
+        el.className = "maplibre-user-marker";
+        el.innerHTML = `<div class="maplibre-user-pulse"></div><div class="maplibre-user-dot"></div>`;
+        userLocationMarker = new maplibregl.Marker({ element: el })
+          .setLngLat([lng, lat])
+          .addTo(mapInstance);
+      } else {
+        userLocationMarker.setLngLat([lng, lat]);
+      }
+
+      mapInstance.flyTo({
+        center: [lng, lat],
+        zoom: 18.2,
+        duration: 1200
+      });
+    }
+
+    const distCampusM =
+      window.CAMPUS_RUTAS &&
+      window.CAMPUS_RUTAS.distanciaMetros([lat, lng], [24.10255, -110.31595]);
+
+    if (distCampusM !== null && distCampusM <= 2500) {
+      let closest = null, minD = 999999;
+      (window.CAMPUS.edificios || []).forEach((e) => {
+        if (e.centro) {
+          const d = window.CAMPUS_RUTAS.distanciaMetros([lat, lng], e.centro);
+          if (d < minD) { minD = d; closest = e; }
+        }
+      });
+      showMapGpsBanner(
+        `<i class="bi bi-geo-alt-fill" style="color:#10B981;"></i> <span>Ubicación detectada (±${acc}m): Cerca de <strong>${closest ? escapeHtml(closest.nombre) : "Campus UABCS"}</strong></span>`,
+        "success",
+        6000,
+        container
+      );
+    } else {
+      const km = Math.round((distCampusM || 3000) / 1000);
+      showMapGpsBanner(
+        `<i class="bi bi-info-circle-fill" style="color:#38BDF8;"></i> <span>Ubicación detectada (±${acc}m): Te encuentras a <strong>${km} km</strong> del Campus UABCS.</span> <button type="button" class="btn-snap-campus-pill" id="btn-snap-banner-campus">Colocarme en Entrada Principal</button>`,
+        "info",
+        10000,
+        container
+      );
+
+      const snapBtn = container.querySelector("#btn-snap-banner-campus");
+      if (snapBtn) {
+        snapBtn.onclick = () => {
+          userGpsCoords = [24.10112, -110.31618];
+          activeRouteOrigin = "entrada-principal";
+          if (originSel) originSel.value = "entrada-principal";
+          if (userLocationMarker) userLocationMarker.setLngLat([-110.31618, 24.10112]);
+          if (mapInstance) mapInstance.flyTo({ center: [-110.31618, 24.10112], zoom: 18 });
+          showMapGpsBanner(`📍 Posición colocada en Entrada Principal UABCS (Simulación)`, "success", 4000, container);
+
+          const sel = window.DASCStore.getState().mapSelection || {};
+          const matchedAula = window.AULAS_DASC && (sel.aulaId || sel.highlightRoom) ? window.AULAS_DASC.buscar(sel.aulaId || sel.highlightRoom) : null;
+          const bldg = window.DASCStore.getBuildingById(sel.buildingId || "dsc-39");
+          const destCoords = (matchedAula && matchedAula.coords) || (bldg && bldg.centro) || [24.10275, -110.31602];
+          const destName = matchedAula ? `${matchedAula.codigo} · ${matchedAula.nombre}` : (bldg ? bldg.name : "Edificio DSC-39");
+          drawPedestrianRouteOnMap(destCoords, destName, container);
+        };
+      }
+    }
+
+    const sel = window.DASCStore.getState().mapSelection || {};
+    const matchedAula =
+      window.AULAS_DASC && (sel.aulaId || sel.highlightRoom)
+        ? window.AULAS_DASC.buscar(sel.aulaId || sel.highlightRoom)
+        : null;
+    const bldg = window.DASCStore.getBuildingById(sel.buildingId || "dsc-39");
+    const destCoords =
+      (matchedAula && matchedAula.coords) ||
+      (bldg && bldg.centro) || [24.10275, -110.31602];
+    const destName = matchedAula
+      ? `${matchedAula.codigo} · ${matchedAula.nombre}`
+      : bldg
+      ? bldg.name
+      : "Edificio DSC-39";
+
+    if (activeRouteOrigin === "gps" || activeRouteOrigin === "click") {
+      drawPedestrianRouteOnMap(destCoords, destName, container);
+    }
+  }
+
+  function handleUserGpsError(err, container = document) {
+    let msg = "";
+    if (err && err.code === 1) {
+      msg = `<strong>Permiso denegado:</strong> Tu navegador tiene bloqueada la ubicación. Haz clic en el 🔒 o configuración junto a la URL y activa "Ubicación".`;
+    } else if (err && err.code === 2) {
+      msg = `<strong>Señal no disponible:</strong> Enciende la ubicación en tu dispositivo o Windows. O haz clic en cualquier lugar del mapa para colocarte.`;
+    } else if (err && err.code === 3) {
+      msg = `<strong>Tiempo de espera agotado:</strong> No se pudo conectar a los satélites GPS. Haz clic en el mapa para ubicarte manualmente.`;
+    } else if (!window.isSecureContext && window.location.hostname !== "localhost" && window.location.hostname !== "127.0.0.1") {
+      msg = `<strong>Restricción del navegador (HTTP):</strong> Al abrir en celular por IP local (http://192.168...), el navegador bloquea el GPS por no ser HTTPS. En PC abre http://localhost:3000 o haz clic en el mapa para ubicarte.`;
+    } else {
+      msg = `<strong>Ubicación no detectada:</strong> (${err && err.message ? err.message : 'Error desconocido'}). Haz clic en cualquier andador para ubicarte.`;
+    }
+    showMapGpsBanner(`<i class="bi bi-exclamation-triangle-fill" style="color:#EF4444;"></i> <span>${msg}</span>`, "error", 9000, container);
+  }
+
+  function requestUserGpsForMap(container, state) {
+    if (!navigator.geolocation) {
+      handleUserGpsError({ code: 2, message: "Geolocalización no soportada en este navegador" }, container);
+      return;
+    }
+    showMapGpsBanner(`<i class="bi bi-arrow-repeat spin"></i> <span>Detectando tu ubicación GPS con satélites en vivo...</span>`, "info", 0, container);
+
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        handleUserGpsSuccess(pos.coords.latitude, pos.coords.longitude, pos.coords.accuracy, container);
+      },
+      (err) => {
+        handleUserGpsError(err, container);
+      },
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 10000 }
+    );
+  }
+
+  function drawPedestrianRouteOnMap(destCoords, destinoNombre, container = document) {
+    if (!window.CAMPUS_RUTAS || !mapInstance) return;
+
+    let originCoords = [24.10112, -110.31618]; // Entrada principal por defecto
+    if ((activeRouteOrigin === "gps" || activeRouteOrigin === "click") && userGpsCoords) {
+      originCoords = userGpsCoords;
+    } else {
+      const acceso = (window.CAMPUS_RUTAS.puntosAcceso || []).find(
+        (p) => p.id === activeRouteOrigin
+      );
+      if (acceso) originCoords = acceso.coords;
+    }
+
+    const ruta = window.CAMPUS_RUTAS.calcularRuta(originCoords, destCoords);
+    currentRouteData = {
+      ...ruta,
+      targetCoords: destCoords,
+      destinoNombre: destinoNombre || "Destino"
+    };
+
+    renderRouteGeoJsonLayer(ruta.waypoints);
+
+    const banner = container.querySelector("#map-route-summary-banner");
+    if (banner) {
+      banner.style.display = "block";
+      banner.innerHTML = `<strong>${ruta.distanciaM} m</strong> · ~${ruta.tiempoMin} min caminando hacia <span>${escapeHtml(destinoNombre)}</span>`;
+    }
+
+    const clearBtn = container.querySelector("#btn-clear-map-route");
+    if (clearBtn) clearBtn.style.display = "inline-flex";
+
+    if (ruta.waypoints && ruta.waypoints.length >= 2) {
+      const bounds = new maplibregl.LngLatBounds();
+      ruta.waypoints.forEach((pt) => bounds.extend([pt[1], pt[0]]));
+      mapInstance.fitBounds(bounds, {
+        padding: { top: 70, bottom: 90, left: 70, right: 70 },
+        pitch: Math.max(35, Math.round((depthPct / 100) * 52)),
+        duration: 1000
+      });
+    }
+  }
+
+  function renderRouteGeoJsonLayer(waypoints) {
+    if (!mapInstance || !waypoints || waypoints.length < 2) return;
+
+    const coordsLngLat = waypoints.map((pt) => [pt[1], pt[0]]);
+    const geojson = {
+      type: "Feature",
+      geometry: {
+        type: "LineString",
+        coordinates: coordsLngLat
+      }
+    };
+
+    if (mapInstance.getSource("uabcs-pedestrian-route")) {
+      mapInstance.getSource("uabcs-pedestrian-route").setData(geojson);
+    } else {
+      mapInstance.addSource("uabcs-pedestrian-route", {
+        type: "geojson",
+        data: geojson
+      });
+
+      mapInstance.addLayer({
+        id: "uabcs-pedestrian-route-glow",
+        type: "line",
+        source: "uabcs-pedestrian-route",
+        layout: { "line-cap": "round", "line-join": "round" },
+        paint: {
+          "line-color": "#38BDF8",
+          "line-width": 10,
+          "line-opacity": 0.35
+        }
+      });
+
+      mapInstance.addLayer({
+        id: "uabcs-pedestrian-route-line",
+        type: "line",
+        source: "uabcs-pedestrian-route",
+        layout: { "line-cap": "round", "line-join": "round" },
+        paint: {
+          "line-color": "#F59E0B",
+          "line-width": 4.5,
+          "line-dasharray": [2, 1.5]
+        }
+      });
+    }
+
+    routeMarkers.forEach((m) => m.remove());
+    routeMarkers = [];
+
+    const startEl = document.createElement("div");
+    startEl.className = "route-endpoint-pin start";
+    startEl.innerHTML = `<i class="bi bi-person-walking"></i>`;
+    const endEl = document.createElement("div");
+    endEl.className = "route-endpoint-pin end";
+    endEl.innerHTML = `<i class="bi bi-flag-fill"></i>`;
+
+    routeMarkers.push(
+      new maplibregl.Marker({ element: startEl })
+        .setLngLat(coordsLngLat[0])
+        .addTo(mapInstance),
+      new maplibregl.Marker({ element: endEl })
+        .setLngLat(coordsLngLat[coordsLngLat.length - 1])
+        .addTo(mapInstance)
+    );
+  }
+
+  function clearPedestrianRouteOnMap(container = document) {
+    currentRouteData = null;
+    routeMarkers.forEach((m) => m.remove());
+    routeMarkers = [];
+    if (mapInstance && mapInstance.getSource("uabcs-pedestrian-route")) {
+      mapInstance.getSource("uabcs-pedestrian-route").setData({
+        type: "FeatureCollection",
+        features: []
+      });
+    }
+    const banner = container.querySelector("#map-route-summary-banner");
+    if (banner) banner.style.display = "none";
+    const clearBtn = container.querySelector("#btn-clear-map-route");
+    if (clearBtn) clearBtn.style.display = "none";
+  }
+
+  function stopRotation360() {
+    isRotating360 = false;
+    if (rotateAnimId) {
+      cancelAnimationFrame(rotateAnimId);
+      rotateAnimId = null;
+    }
+  }
+
+  // =========================================================================
+  // PLANO OFICIAL PDF 2022 + CROQUIS DE TALLERES
+  // =========================================================================
+  function renderPdfLayout() {
+    return `
+      <div class="pdf-official-layout">
+        <div class="pdf-toolbar-strip">
+          <div>
+            <span class="vr-live-pill"><i class="bi bi-file-earmark-pdf-fill"></i> NOMENCLATURA OFICIAL SIIA 2022</span>
+            <h3>Plano Oficial del Campus La Paz UABCS y Croquis de Talleres DASC</h3>
+          </div>
+          <div class="pdf-toolbar-btns">
+            <a href="./img/Mapa-Campus-La-Paz-2022.pdf" download="Mapa-Campus-La-Paz-2022.pdf" class="btn-primary btn-sm-action">
+              <i class="bi bi-download"></i> Descargar PDF Oficial
+            </a>
+            <a href="./img/eventos/mapa_talleres.jpg" target="_blank" rel="noopener" class="btn-secondary-tech btn-sm-action">
+              <i class="bi bi-image"></i> Ver Mapa de Talleres DASC ↗
+            </a>
+          </div>
+        </div>
+        <div class="pdf-split-view">
+          <iframe src="./img/Mapa-Campus-La-Paz-2022.pdf" class="pdf-embed-frame" title="Plano Oficial Campus La Paz 2022"></iframe>
+          <div class="pdf-talleres-card">
+            <h4>Croquis Oficial de Laboratorios y Talleres DASC</h4>
+            <img src="./img/eventos/mapa_talleres.jpg" alt="Mapa de Talleres DASC" class="talleres-preview-img" />
           </div>
         </div>
       </div>
     `;
-  }
-
-  function bindMapEvents(container, state) {
-    container.querySelectorAll("[data-map-cat]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        activeCategoryFilter = btn.getAttribute("data-map-cat") || "all";
-        if (activeCategoryFilter === "dasc") {
-          window.DASCStore.selectBuildingInMap("dsc-39");
-        } else {
-          window.DASCMapView.render(container, window.DASCStore.getState());
-        }
-      });
-    });
-
-    container
-      .querySelectorAll("[data-select-building], [data-building-node]")
-      .forEach((el) => {
-        el.addEventListener("click", (e) => {
-          e.stopPropagation();
-          const bId =
-            el.getAttribute("data-select-building") ||
-            el.getAttribute("data-building-node");
-          if (bId) {
-            selectedSalonCodeInPanel = null;
-            window.DASCStore.selectBuildingInMap(bId);
-          }
-        });
-      });
-
-    container.querySelectorAll("[data-select-salon]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        selectedSalonCodeInPanel = btn.getAttribute("data-select-salon");
-        window.DASCMapView.render(container, window.DASCStore.getState());
-      });
-    });
-
-    container.querySelectorAll("[data-map-mode]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const is3D = btn.getAttribute("data-map-mode") === "3d";
-        window.DASCStore.setMapMode3D(is3D);
-      });
-    });
-
-    const tiltRange = container.querySelector("#map-tilt-range");
-    if (tiltRange) {
-      tiltRange.addEventListener("input", (e) => {
-        const deg = Number(e.target.value) || 38;
-        const plane = container.querySelector("#dasc-map-plane");
-        if (plane) {
-          plane.style.transform = `translate3d(${panOffset.x}px, ${panOffset.y}px, 0) scale(${state.mapSelection.zoomLevel}) rotateX(${deg}deg) rotateZ(-10deg)`;
-        }
-      });
-      tiltRange.addEventListener("change", (e) => {
-        window.DASCStore.setMapTiltAngle(Number(e.target.value) || 38);
-      });
-    }
-
-    const zoomIn = container.querySelector("#btn-zoom-in");
-    const zoomOut = container.querySelector("#btn-zoom-out");
-    const zoomReset = container.querySelector("#btn-zoom-reset");
-
-    if (zoomIn) {
-      zoomIn.addEventListener("click", () => {
-        window.DASCStore.setMapZoom(state.mapSelection.zoomLevel + 0.15);
-      });
-    }
-    if (zoomOut) {
-      zoomOut.addEventListener("click", () => {
-        window.DASCStore.setMapZoom(state.mapSelection.zoomLevel - 0.15);
-      });
-    }
-    if (zoomReset) {
-      zoomReset.addEventListener("click", () => {
-        panOffset = { x: 0, y: 0 };
-        window.DASCStore.setMapZoom(1.0);
-      });
-    }
-
-    const viewport = container.querySelector("#dasc-map-viewport");
-    const plane = container.querySelector("#dasc-map-plane");
-
-    if (viewport && plane) {
-      const startDrag = (clientX, clientY) => {
-        isDraggingMap = true;
-        dragStart = { x: clientX - panOffset.x, y: clientY - panOffset.y };
-        viewport.classList.add("dragging");
-      };
-
-      const moveDrag = (clientX, clientY) => {
-        if (!isDraggingMap) return;
-        panOffset.x = Math.max(-280, Math.min(280, clientX - dragStart.x));
-        panOffset.y = Math.max(-240, Math.min(240, clientY - dragStart.y));
-        const tilt = state.mapSelection.mode3D
-          ? Number(state.mapSelection.tiltAngle || 38)
-          : 0;
-        const modeTransform = state.mapSelection.mode3D
-          ? `rotateX(${tilt}deg) rotateZ(-10deg)`
-          : "rotateX(0deg) rotateZ(0deg)";
-        plane.style.transform = `translate3d(${panOffset.x}px, ${panOffset.y}px, 0) scale(${state.mapSelection.zoomLevel}) ${modeTransform}`;
-      };
-
-      const endDrag = () => {
-        isDraggingMap = false;
-        viewport.classList.remove("dragging");
-      };
-
-      viewport.addEventListener("mousedown", (e) => {
-        if (e.target.closest("[data-building-node]")) return;
-        startDrag(e.clientX, e.clientY);
-      });
-      window.addEventListener("mousemove", (e) => moveDrag(e.clientX, e.clientY));
-      window.addEventListener("mouseup", endDrag);
-
-      viewport.addEventListener(
-        "touchstart",
-        (e) => {
-          if (e.target.closest("[data-building-node]")) return;
-          if (e.touches.length === 1) {
-            startDrag(e.touches[0].clientX, e.touches[0].clientY);
-          }
-        },
-        { passive: true }
-      );
-      viewport.addEventListener(
-        "touchmove",
-        (e) => {
-          if (e.touches.length === 1) {
-            moveDrag(e.touches[0].clientX, e.touches[0].clientY);
-          }
-        },
-        { passive: true }
-      );
-      viewport.addEventListener("touchend", endDrag);
-    }
-
-    const open360Btn = container.querySelector("#btn-open-360");
-    if (open360Btn) {
-      open360Btn.addEventListener("click", () => {
-        const bId = open360Btn.getAttribute("data-building-id");
-        window.DASCStore.open360Modal(bId);
-      });
-    }
-
-    const openArBtn = container.querySelector("#btn-open-ar-map");
-    if (openArBtn) {
-      openArBtn.addEventListener("click", () => {
-        const bId = openArBtn.getAttribute("data-building-id");
-        const dest = openArBtn.getAttribute("data-destination");
-        window.DASCStore.openARGuide({
-          buildingId: bId,
-          destinationLabel: dest
-        });
-      });
-    }
-  }
-
-  function init360CanvasViewer(container, state) {
-    const building =
-      window.DASCStore.getBuildingById(state.modal360.buildingId) ||
-      window.DASCStore.getBuildings()[0];
-    const pano = building.panorama360;
-    if (!pano) return;
-    const activeScene =
-      pano.scenes.find((s) => s.id === state.modal360.sceneId) || pano.scenes[0];
-
-    const canvas = container.querySelector("#pano-canvas-360");
-    const hotspotsLayer = container.querySelector("#pano-hotspots-layer");
-    const panoViewport = container.querySelector("#pano-viewport");
-
-    if (!canvas || !hotspotsLayer) return;
-    const ctx = canvas.getContext("2d");
-
-    const closeBtn = container.querySelector("#btn-close-360");
-    const backdrop = container.querySelector("#modal-360-backdrop");
-    if (closeBtn) {
-      closeBtn.addEventListener("click", () => {
-        stopPanoLoop();
-        window.DASCStore.close360Modal();
-      });
-    }
-    if (backdrop) {
-      backdrop.addEventListener("click", (e) => {
-        if (e.target === backdrop) {
-          stopPanoLoop();
-          window.DASCStore.close360Modal();
-        }
-      });
-    }
-
-    container.querySelectorAll("[data-scene-id]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const scId = btn.getAttribute("data-scene-id");
-        panoYaw = 0;
-        window.DASCStore.set360Scene(scId);
-      });
-    });
-
-    const btnLeft = container.querySelector("#btn-pano-left");
-    const btnRight = container.querySelector("#btn-pano-right");
-    const btnAuto = container.querySelector("#btn-pano-autorotate");
-
-    if (btnLeft) {
-      btnLeft.addEventListener("click", () => {
-        autoRotate360 = false;
-        panoYaw = (panoYaw - 30 + 360) % 360;
-      });
-    }
-    if (btnRight) {
-      btnRight.addEventListener("click", () => {
-        autoRotate360 = false;
-        panoYaw = (panoYaw + 30) % 360;
-      });
-    }
-    if (btnAuto) {
-      btnAuto.addEventListener("click", () => {
-        autoRotate360 = !autoRotate360;
-        btnAuto.textContent = autoRotate360 ? "⏸ Pausar Giro" : "▶ Giro Automático";
-        btnAuto.classList.toggle("active", autoRotate360);
-      });
-    }
-
-    const onPointerDown = (clientX, clientY) => {
-      isDraggingPano = true;
-      autoRotate360 = false;
-      panoDragStart = { x: clientX, y: clientY, yaw: panoYaw, pitch: panoPitch };
-    };
-
-    const onPointerMove = (clientX, clientY) => {
-      if (!isDraggingPano) return;
-      const dx = clientX - panoDragStart.x;
-      const dy = clientY - panoDragStart.y;
-      panoYaw = (panoDragStart.yaw - dx * 0.35 + 360) % 360;
-      panoPitch = Math.max(-25, Math.min(25, panoDragStart.pitch + dy * 0.18));
-    };
-
-    const onPointerUp = () => {
-      isDraggingPano = false;
-    };
-
-    panoViewport.addEventListener("mousedown", (e) => {
-      if (e.target.closest(".pano-hotspot-pin") || e.target.closest(".pano-controls-bar")) return;
-      onPointerDown(e.clientX, e.clientY);
-    });
-    window.addEventListener("mousemove", (e) => onPointerMove(e.clientX, e.clientY));
-    window.addEventListener("mouseup", onPointerUp);
-
-    hotspotsLayer.innerHTML = (activeScene.elements || [])
-      .map(
-        (el, idx) => `
-        <button
-          type="button"
-          class="pano-hotspot-pin ${el.targetScene ? "is-portal" : ""}"
-          data-hotspot-idx="${idx}"
-          data-target-scene="${escapeHtml(el.targetScene || "")}"
-        >
-          <span class="hotspot-icon">${el.targetScene ? "🚪" : "📍"}</span>
-          <span class="hotspot-text">${escapeHtml(el.label)}</span>
-        </button>
-      `
-      )
-      .join("");
-
-    hotspotsLayer.querySelectorAll(".pano-hotspot-pin").forEach((pin) => {
-      pin.addEventListener("click", () => {
-        const targetScene = pin.getAttribute("data-target-scene");
-        if (targetScene) {
-          panoYaw = 0;
-          window.DASCStore.set360Scene(targetScene);
-        }
-      });
-    });
-
-    const hotspotNodes = Array.from(hotspotsLayer.querySelectorAll(".pano-hotspot-pin"));
-
-    function renderFrame() {
-      if (autoRotate360 && !isDraggingPano) {
-        panoYaw = (panoYaw + 0.18) % 360;
-      }
-
-      draw360Interior(ctx, canvas.width, canvas.height, activeScene, panoYaw, panoPitch);
-
-      const fov = 110;
-      (activeScene.elements || []).forEach((el, idx) => {
-        const node = hotspotNodes[idx];
-        if (!node) return;
-        let deltaYaw = ((el.yaw - panoYaw + 540) % 360) - 180;
-        if (Math.abs(deltaYaw) <= fov / 2) {
-          const xPct = 50 + (deltaYaw / (fov / 2)) * 46;
-          const yPct = 50 - ((el.pitch - panoPitch) / 45) * 35;
-          node.style.display = "inline-flex";
-          node.style.left = `${xPct}%`;
-          node.style.top = `${yPct}%`;
-        } else {
-          node.style.display = "none";
-        }
-      });
-
-      panoAnimFrame = requestAnimationFrame(renderFrame);
-    }
-
-    renderFrame();
-  }
-
-  function draw360Interior(ctx, w, h, scene, yaw, pitch) {
-    ctx.clearRect(0, 0, w, h);
-    const horizonY = h * 0.5 + pitch * 4.2;
-
-    const ceilGrad = ctx.createLinearGradient(0, 0, 0, horizonY);
-    ceilGrad.addColorStop(0, "#070b14");
-    ceilGrad.addColorStop(1, "#111b2e");
-    ctx.fillStyle = ceilGrad;
-    ctx.fillRect(0, 0, w, horizonY);
-
-    const floorGrad = ctx.createLinearGradient(0, horizonY, 0, h);
-    floorGrad.addColorStop(0, "#0f172a");
-    floorGrad.addColorStop(1, "#090d16");
-    ctx.fillStyle = floorGrad;
-    ctx.fillRect(0, horizonY, w, h - horizonY);
-
-    const wallTop = horizonY - 125;
-    const wallBottom = horizonY + 95;
-    const wallGrad = ctx.createLinearGradient(0, wallTop, 0, wallBottom);
-    wallGrad.addColorStop(0, scene.themeColor || "#1e3a8a");
-    wallGrad.addColorStop(1, "#0f172a");
-    ctx.fillStyle = wallGrad;
-    ctx.fillRect(0, wallTop, w, wallBottom - wallTop);
-
-    ctx.strokeStyle = "rgba(148, 163, 184, 0.22)";
-    ctx.lineWidth = 1.5;
-    const fov = 110;
-    for (let deg = 0; deg < 360; deg += 30) {
-      let delta = ((deg - yaw + 540) % 360) - 180;
-      if (Math.abs(delta) <= fov / 1.6) {
-        const x = w / 2 + (delta / (fov / 2)) * (w * 0.48);
-        ctx.beginPath();
-        ctx.moveTo(x, wallTop);
-        ctx.lineTo(x, wallBottom);
-        ctx.stroke();
-
-        ctx.fillStyle = "rgba(245, 158, 11, 0.75)";
-        ctx.font = "600 11px system-ui, sans-serif";
-        ctx.fillText(`${deg}°`, x - 10, wallTop - 10);
-      }
-    }
   }
 
   function escapeHtml(str) {

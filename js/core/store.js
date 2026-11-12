@@ -1,7 +1,8 @@
 /**
  * store.js
  * Gestor centralizado de estado y conexión a la Base de Datos SQL (API /api/* + Respaldo SQL Local)
- * para el Portal UABCS - DASC (Inicio, Horario, Mapa 2D/3D y Directorio)
+ * Unifica los catálogos oficiales de Maps UABCS (window.CAMPUS, window.AULAS_DASC, window.CAMPUS_RUTAS, window.PANORAMAS, window.EVENTOS_UABCS)
+ * con el sistema de Horarios SQL de Ingeniería en Desarrollo de Software.
  */
 
 (function () {
@@ -12,12 +13,159 @@
     EVENTS: "dasc_uabcs_events_v2"
   };
 
+  // Mapeo bidireccional entre IDs legados (mockData / SQL) e IDs geográficos oficiales de CAMPUS (edificios.js)
+  const LEGACY_TO_CAMPUS_ID = {
+    "dsc-39": "dasc",
+    "dsc39": "dasc",
+    "dasc": "dasc",
+    "dsc-46": "dasc-ii",
+    "dsc46": "dasc-ii",
+    "dasc-ii": "dasc-ii",
+    "dsc-46b": "nuevo-dasc",
+    "nuevo-dasc": "nuevo-dasc",
+    "ad-20": "biblioteca",
+    "biblioteca": "biblioteca",
+    "ad-19": "rectoria",
+    "rectoria": "rectoria",
+    "ad-52": "poliforo",
+    "poliforo": "poliforo",
+    "ad-18": "dele",
+    "dele": "dele",
+    "ad-55": "servicios-escolares",
+    "control-escolar": "control-escolar",
+    "servicios-escolares": "servicios-escolares",
+    "ad-65": "ctic",
+    "ctic": "ctic",
+    "ad-01": "gimnasio",
+    "gimnasio": "gimnasio",
+    "ad-58": "campo-uabcs",
+    "campo-uabcs": "campo-uabcs",
+    "ad-21": "centro-medico",
+    "centro-medico": "centro-medico",
+    "ad-10": "cafeteria",
+    "cafeteria": "cafeteria",
+    "ad-59": "caseta-vigilancia",
+    "caseta-vigilancia": "caseta-vigilancia",
+    "ad-40": "edificio-redes",
+    "edificio-redes": "edificio-redes",
+    "planta-tratamiento": "edificio-redes",
+    "csh-02": "auditorio-ciencias-sociales",
+    "cmt-03": "biologia-marina",
+    "ca-04": "ciencias-agropecuarias-1"
+  };
+
   function safeParse(jsonStr, fallback) {
     try {
       return jsonStr ? JSON.parse(jsonStr) : fallback;
     } catch (e) {
       return fallback;
     }
+  }
+
+  // Construir catálogo unificado de edificios combinando window.CAMPUS.edificios + window.DASC_MOCK_DATA.buildings
+  function buildUnifiedBuildingsCatalog() {
+    const mockBuildings = (window.DASC_MOCK_DATA && window.DASC_MOCK_DATA.buildings) || [];
+    const campusEdificios = (window.CAMPUS && window.CAMPUS.edificios) || [];
+    const aulasCatalog = (window.AULAS_DASC && window.AULAS_DASC.salones) || [];
+
+    const mockByCampusId = new Map();
+    mockBuildings.forEach((mb) => {
+      const mappedCampusId = LEGACY_TO_CAMPUS_ID[String(mb.id).toLowerCase()] || String(mb.id).toLowerCase();
+      mockByCampusId.set(mappedCampusId, mb);
+    });
+
+    const unified = [];
+    const seenCampusIds = new Set();
+
+    campusEdificios.forEach((ce) => {
+      if (ce.esVialidad) return; // Ignorar vialidades en el listado de edificios
+      seenCampusIds.add(ce.id);
+      const mockMatch = mockByCampusId.get(ce.id) || null;
+      const aulasInBuilding = aulasCatalog.filter(
+        (a) => a.edificioId === ce.id || String(a.edificioLegacy || "").toLowerCase() === String(mockMatch?.id || "").toLowerCase()
+      );
+
+      const categoryMap = {
+        sistemas: "dasc",
+        administracion: "administrativo",
+        escolar: "academico",
+        cultura: "servicios",
+        deportes: "deportivo",
+        servicios: "servicios",
+        pecuario: "academico"
+      };
+
+      const legacyId =
+        ce.id === "dasc"
+          ? "dsc-39"
+          : ce.id === "dasc-ii"
+          ? "dsc-46"
+          : ce.id === "nuevo-dasc"
+          ? "dsc-46b"
+          : mockMatch
+          ? mockMatch.id
+          : ce.id;
+
+      unified.push({
+        id: legacyId,
+        campusId: ce.id,
+        code: ce.codigoMapa || (mockMatch && mockMatch.code) || ce.id.toUpperCase(),
+        codigoMapa: ce.codigoMapa || (mockMatch && mockMatch.code) || "S/N",
+        name: ce.nombre,
+        shortName: (mockMatch && mockMatch.shortName) || ce.nombre,
+        category: categoryMap[ce.categoria] || (mockMatch && mockMatch.category) || "academico",
+        campusCategory: ce.categoria || "escolar",
+        color: ce.color || "#3B82F6",
+        icono: ce.icono || "bi-building",
+        imagen: ce.imagen || "./img/uabcs.jpg",
+        centro: ce.centro || [24.10275, -110.31602],
+        coords: ce.coords || [],
+        levels: ce.pisos ? `${ce.pisos} Nivel${ce.pisos > 1 ? "es" : ""}` : (mockMatch && mockMatch.levels) || "1 Nivel",
+        pisos: ce.pisos || 1,
+        alturaM: ce.alturaM || 5,
+        estilo3D: ce.estilo3D || "admin",
+        schedule: ce.horario || (mockMatch && mockMatch.schedule) || "07:00 - 21:00 hrs",
+        description: ce.descripcion || (mockMatch && mockMatch.description) || "",
+        services: ce.servicios || (mockMatch && mockMatch.services) || [],
+        contacto: ce.contacto || null,
+        enlaceWeb: ce.enlaceWeb || null,
+        tourOficial: ce.tourOficial || null,
+        salones:
+          aulasInBuilding.length > 0
+            ? aulasInBuilding.map((a) => ({
+                code: a.codigo,
+                name: a.nombre,
+                floor: a.planta,
+                type: a.tipo,
+                id: a.id,
+                coords: a.coords,
+                capacidad: a.capacidad,
+                equipamiento: a.equipamiento,
+                scenePano: a.scenePano
+              }))
+            : (mockMatch && mockMatch.salones) || [],
+        classrooms:
+          aulasInBuilding.length > 0
+            ? aulasInBuilding.map((a) => `${a.codigo} (${a.nombre})`)
+            : (mockMatch && mockMatch.classrooms) || [],
+        panorama360: (mockMatch && mockMatch.panorama360) || null
+      });
+    });
+
+    // Agregar cualquier edificio de mockData que no estuviera en CAMPUS
+    mockBuildings.forEach((mb) => {
+      const mapped = LEGACY_TO_CAMPUS_ID[String(mb.id).toLowerCase()];
+      if (!mapped || !seenCampusIds.has(mapped)) {
+        unified.push({
+          ...mb,
+          campusId: mapped || mb.id,
+          centro: [24.10275, -110.31602],
+          imagen: "./img/uabcs.jpg"
+        });
+      }
+    });
+
+    return unified;
   }
 
   // Consulta relacional en memoria (espejo exacto del JOIN de server.js sobre las tablas SQL: horarios, materias, maestros, salones)
@@ -162,6 +310,7 @@
   const defaultSem = savedUser ? Number(savedUser.semester || savedUser.semestre || 5) : 5;
   const defaultTurno = savedUser ? savedUser.turno || "Matutino" : "Matutino";
   const defaultGrupo = savedUser ? savedUser.grupo || "A" : "A";
+  const unifiedBuildings = buildUnifiedBuildingsCatalog();
 
   const state = {
     user: savedUser,
@@ -180,19 +329,24 @@
     currentScheduleData: runRelationalJoinLocal(defaultSem, defaultTurno, defaultGrupo),
     mapSelection: {
       buildingId: "dsc-39",
+      campusId: "dasc",
       highlightRoom: null,
+      aulaId: null,
       categoryFilter: "all",
       zoomLevel: 1.05,
       mode3D: true,
-      tiltAngle: 36,
+      tiltAngle: 52,
+      mapSubMode: "interactive", // 'interactive' | '360' | 'sketchfab' | 'pdf'
+      panoSceneId: "1",
       autoTriggered: false,
       showPdfModal: false
     },
     modal360: {
       isOpen: false,
       buildingId: null,
-      sceneId: null
+      sceneId: "1"
     },
+    buildingsCatalog: unifiedBuildings,
     homeInfo: window.DASC_MOCK_DATA.homeInfo,
     professors: window.DASC_MOCK_DATA.professors,
     directoryPlaces: window.DASC_MOCK_DATA.directoryPlaces,
@@ -484,14 +638,29 @@
       notify();
     },
 
-    focusBuildingOnMap({ buildingId, highlightRoom = null }) {
+    focusBuildingOnMap({ buildingId, highlightRoom = null, aulaId = null, subMode = "interactive" }) {
       state.arOverlayActive = false;
       state.activeView = "mapa";
-      const matched = this.getBuildingById(buildingId);
+
+      // Resolver aula geolocalizada si se proporcionó salón o aulaId
+      const matchedAula =
+        window.AULAS_DASC && (highlightRoom || aulaId)
+          ? window.AULAS_DASC.buscar(aulaId || highlightRoom)
+          : null;
+
+      const effectiveBuildingId = matchedAula
+        ? matchedAula.edificioLegacy || matchedAula.edificioId
+        : buildingId || "dsc-39";
+
+      const matched = this.getBuildingById(effectiveBuildingId);
       state.mapSelection = {
         ...state.mapSelection,
         buildingId: matched ? matched.id : "dsc-39",
-        highlightRoom: highlightRoom,
+        campusId: matched ? matched.campusId : "dasc",
+        highlightRoom: highlightRoom || (matchedAula ? `${matchedAula.codigo} (${matchedAula.nombre})` : null),
+        aulaId: matchedAula ? matchedAula.id : aulaId,
+        panoSceneId: matchedAula && matchedAula.scenePano ? matchedAula.scenePano : state.mapSelection.panoSceneId || "1",
+        mapSubMode: subMode || "interactive",
         categoryFilter: "all",
         zoomLevel: 1.15,
         autoTriggered: true
@@ -499,12 +668,28 @@
       notify();
     },
 
-    selectBuildingInMap(buildingId) {
+    selectBuildingInMap(buildingId, highlightRoom = null, aulaId = null) {
+      const matchedAula =
+        window.AULAS_DASC && (highlightRoom || aulaId)
+          ? window.AULAS_DASC.buscar(aulaId || highlightRoom)
+          : null;
       const matched = this.getBuildingById(buildingId);
       state.mapSelection = {
         ...state.mapSelection,
         buildingId: matched ? matched.id : "dsc-39",
-        highlightRoom: null,
+        campusId: matched ? matched.campusId : "dasc",
+        highlightRoom: highlightRoom,
+        aulaId: matchedAula ? matchedAula.id : aulaId,
+        autoTriggered: false
+      };
+      notify();
+    },
+
+    setMapSubMode(subMode, panoSceneId = null) {
+      state.mapSelection = {
+        ...state.mapSelection,
+        mapSubMode: subMode || "interactive",
+        panoSceneId: panoSceneId || state.mapSelection.panoSceneId || "1",
         autoTriggered: false
       };
       notify();
@@ -529,7 +714,7 @@
     },
 
     setMapTilt(angle) {
-      const clamped = Math.max(0, Math.min(55, Number(angle)));
+      const clamped = Math.max(0, Math.min(60, Number(angle)));
       state.mapSelection = {
         ...state.mapSelection,
         tiltAngle: clamped,
@@ -554,45 +739,51 @@
     },
 
     open360Modal(buildingId, sceneId = null) {
-      const building = this.getBuildingById(buildingId);
-      if (!building || !building.panorama360) return;
-      state.modal360 = {
-        isOpen: true,
-        buildingId: building.id,
-        sceneId: sceneId || building.panorama360.defaultScene
-      };
-      notify();
+      this.focusBuilding(buildingId || "dsc-39", sceneId);
     },
 
     set360Scene(sceneId) {
-      if (!state.modal360.isOpen) return;
-      state.modal360 = {
-        ...state.modal360,
-        sceneId
-      };
-      notify();
+      // Stub de compatibilidad
     },
 
     close360Modal() {
-      state.modal360 = {
-        isOpen: false,
-        buildingId: null,
-        sceneId: null
-      };
-      notify();
+      // Stub de compatibilidad
     },
 
-    openARGuide({ buildingId, destinationLabel, subject = "", professor = "" }) {
-      const building = this.getBuildingById(buildingId) || window.DASC_MOCK_DATA.buildings[0];
+    openARGuide({ buildingId, destinationLabel, subject = "", professor = "", aulaId = null, coords = null }) {
+      const matchedAula =
+        window.AULAS_DASC && (aulaId || destinationLabel)
+          ? window.AULAS_DASC.buscar(aulaId || destinationLabel)
+          : null;
+
+      const building =
+        this.getBuildingById(matchedAula ? matchedAula.edificioId : buildingId) ||
+        state.buildingsCatalog[0];
+
+      const targetCoords =
+        coords ||
+        (matchedAula && matchedAula.coords) ||
+        (building && building.centro) || [24.10275, -110.31602];
+
       state.arTarget = {
         buildingId: building.id,
+        campusId: building.campusId || "dasc",
+        buildingCode: building.code || "DSC-39",
         buildingName: building.name,
-        destinationLabel: destinationLabel || building.name,
+        aulaId: matchedAula ? matchedAula.id : null,
+        aulaCodigo: matchedAula ? matchedAula.codigo : null,
+        planta: matchedAula ? matchedAula.planta : building.levels || "Planta Baja",
+        destinationLabel:
+          destinationLabel ||
+          (matchedAula ? `${matchedAula.codigo} · ${matchedAula.nombre}` : building.name),
         subject: subject,
         professor: professor,
-        distanceMeters: building.distanceMeters || 50,
-        arBearing: building.arBearing || 35,
-        arInstruction: building.arInstruction || `Dirígete hacia ${building.name}.`
+        coords: targetCoords,
+        scenePano: matchedAula && matchedAula.scenePano ? matchedAula.scenePano : "1",
+        imagen: building.imagen || "./img/recorrido/edificio-sistemas.jpg",
+        arInstruction: matchedAula
+          ? `${matchedAula.referenciaAcceso}. Ubicado en ${matchedAula.edificioCodigo} (${matchedAula.planta}).`
+          : `Dirígete hacia ${building.name} (${building.code}).`
       };
       state.arOverlayActive = true;
       notify();
@@ -604,15 +795,21 @@
     },
 
     getBuildings() {
-      return window.DASC_MOCK_DATA.buildings;
+      return state.buildingsCatalog;
     },
 
     getBuildingById(buildingId) {
       if (!buildingId) return null;
-      const target = String(buildingId).toLowerCase();
+      const raw = String(buildingId).trim().toLowerCase();
+      const mappedCampusId = LEGACY_TO_CAMPUS_ID[raw] || raw;
+
       return (
-        window.DASC_MOCK_DATA.buildings.find(
-          (b) => b.id.toLowerCase() === target || b.code.toLowerCase() === target
+        state.buildingsCatalog.find(
+          (b) =>
+            String(b.id).toLowerCase() === raw ||
+            String(b.campusId).toLowerCase() === raw ||
+            String(b.campusId).toLowerCase() === mappedCampusId ||
+            String(b.code).toLowerCase() === raw
         ) || null
       );
     },
@@ -660,6 +857,7 @@
             turno: h.turno,
             grupo: h.grupo,
             dia: h.dia,
+            bloque_horario: h.bloque_horario,
             materia_nombre: mat.nombre || "Asignatura IDS",
             maestro_nombre: mae.nombre || "Docente DASC"
           };
